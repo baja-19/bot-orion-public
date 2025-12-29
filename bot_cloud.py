@@ -8,8 +8,8 @@ import time
 from datetime import datetime
 
 # KONFIGURASI
-DATABASE_URL = "https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/"
-URL_TARGET = "https://orionterminal.com/screener"
+DATABASE_URL = "[https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/](https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/)"
+URL_TARGET = "[https://orionterminal.com/screener](https://orionterminal.com/screener)"
 TIMEOUT_LIMIT = 280
 
 # 36 VARIABEL
@@ -35,7 +35,7 @@ def init_firebase():
     except: return False
 
 def run_debug_screenshot():
-    print("🤖 BOT DEBUGGING (SCREENSHOT)...")
+    print("BOT DEBUGGING (SCREENSHOT)...")
     if not init_firebase(): return
 
     co = ChromiumOptions()
@@ -46,51 +46,32 @@ def run_debug_screenshot():
 
     try:
         page = ChromiumPage(addr_or_opts=co)
-        print(f"🌐 Membuka URL...")
+        print("Membuka URL...")
         
         # Set timeout loading
         page.set.timeouts(page_load=60)
         try: page.get(URL_TARGET)
         except: pass
 
-        print("⏳ Menunggu 30 detik...")
+        print("Menunggu 30 detik...")
         time.sleep(30)
         
         # === AMBIL FOTO BUKTI ===
-        print("📸 Cekrek! Mengambil screenshot...")
+        print("Cekrek! Mengambil screenshot...")
         page.get_screenshot(path='bukti.png', full_page=True)
-        print("✅ Screenshot tersimpan sebagai 'bukti.png'")
+        print("Screenshot tersimpan sebagai 'bukti.png'")
 
         # Cek Data
         raw_text = page.run_js("return document.body.innerText")
-        print(f"📄 Panjang Teks di Layar: {len(raw_text)} karakter")
+        print("Panjang Teks di Layar: " + str(len(raw_text)) + " karakter")
         
         if "Verify you are human" in raw_text:
-            print("🚨 TERDETEKSI BLOKIR CLOUDFLARE!")
-        
-        # ... (Logika upload sama seperti sebelumnya) ...
-        # (Disingkat biar fokus ke screenshot)
+            print("TERDETEKSI BLOKIR CLOUDFLARE!")
         
         page.quit()
 
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print("Error: " + str(e))
 
 if __name__ == "__main__":
     run_debug_screenshot()
-```
-
-### Tambahkan Langkah Upload Artifact di YAML
-
-Anda juga harus mengedit file `.yml` (Workflow) agar hasil fotonya bisa didownload.
-
-1.  Buka file `.yml` di folder `.github/workflows`.
-2.  Tambahkan langkah ini di **paling bawah**:
-
-```yaml
-      - name: Upload Bukti Foto
-        uses: actions/upload-artifact@v4
-        if: always() # Selalu jalankan walau error
-        with:
-          name: bukti-layar
-          path: bukti.png
