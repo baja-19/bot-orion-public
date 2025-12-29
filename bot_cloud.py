@@ -8,8 +8,8 @@ import time
 from datetime import datetime
 
 # KONFIGURASI
-DATABASE_URL = "[https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/](https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/)"
-URL_TARGET = "[https://orionterminal.com/screener](https://orionterminal.com/screener)"
+DATABASE_URL = "https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/"
+URL_TARGET = "https://orionterminal.com/screener"
 TIMEOUT_LIMIT = 280
 
 # 36 VARIABEL
@@ -34,39 +34,74 @@ def init_firebase():
         return True
     except: return False
 
-def run_debug_screenshot():
-    print("BOT DEBUGGING (SCREENSHOT)...")
+def run_safe_loop():
+    print("BOT GITHUB SAFE MODE...")
+    start_global = time.time()
+    
     if not init_firebase(): return
 
     co = ChromiumOptions()
     co.set_argument('--headless=new')
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
-    co.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    co.set_user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     try:
         page = ChromiumPage(addr_or_opts=co)
-        print("Membuka URL...")
+        page.set.timeouts(page_load=30)
         
-        # Set timeout loading
-        page.set.timeouts(page_load=60)
-        try: page.get(URL_TARGET)
-        except: pass
+        print("Membuka Orion...")
+        try:
+            page.get(URL_TARGET)
+        except:
+            print("Website lambat/timeout, tapi kita coba lanjut...")
 
-        print("Menunggu 30 detik...")
-        time.sleep(30)
-        
-        # === AMBIL FOTO BUKTI ===
-        print("Cekrek! Mengambil screenshot...")
-        page.get_screenshot(path='bukti.png', full_page=True)
-        print("Screenshot tersimpan sebagai 'bukti.png'")
+        print("Tunggu render...")
+        time.sleep(15)
 
-        # Cek Data
-        raw_text = page.run_js("return document.body.innerText")
-        print("Panjang Teks di Layar: " + str(len(raw_text)) + " karakter")
+        ref = db.reference('screener_full_data')
         
-        if "Verify you are human" in raw_text:
-            print("TERDETEKSI BLOKIR CLOUDFLARE!")
+        loop_count = 0
+        
+        while True:
+            durasi = time.time() - start_global
+            if durasi > TIMEOUT_LIMIT:
+                print("WAKTU HABIS. Matikan Bot.")
+                break
+
+            try:
+                page.run_js("window.scrollTo(0, 10000);")
+                time.sleep(0.5)
+                
+                full_text = page.run_js("return document.body.innerText")
+                lines = full_text.split('\n')
+                
+                data_batch = {}
+                count = 0
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                for line in lines:
+                    line = line.strip()
+                    if 2 <= len(line) <= 6 and line.isalpha() and line.isupper():
+                        try:
+                            # Logika Parsing Sederhana Cepat
+                            # Asumsi baris koin diikuti data angka
+                            # Kita ambil baris itu saja sebagai RAW DATA agar cepat
+                            data_batch[line] = {'raw': line, 'updated': ts}
+                            count += 1
+                        except: continue
+
+                if data_batch:
+                    ref.update(data_batch)
+                    loop_count += 1
+                    print("Update: " + str(count) + " Koin")
+                else:
+                    print("Data kosong (Mungkin Cloudflare).")
+                
+                time.sleep(5) 
+
+            except Exception:
+                pass
         
         page.quit()
 
@@ -74,4 +109,5 @@ def run_debug_screenshot():
         print("Error: " + str(e))
 
 if __name__ == "__main__":
-    run_debug_screenshot()
+    run_safe_loop()
+    sys.exit(0)
