@@ -15,15 +15,12 @@ DATABASE_URL = "https://quant-trading-d5411-default-rtdb.asia-southeast1.firebas
 URL_TARGET = "https://orionterminal.com/screener"
 TIMEOUT_LIMIT = 280
 
-# LIST BLACKLIST (Menu yang harus dihindari)
 BLACKLIST = [
     "ALERTS", "CHARTS", "CLI", "SCREENER", "PORTFOLIO", "SETTINGS",
     "LOGIN", "SIGNUP", "CONNECT", "WALLET", "SEARCH", "FILTER",
-    "COLUMNS", "EXPORT", "SHARE", "FEEDBACK", "HELP", "MARKET",
-    "TYPE", "PRICE", "CHANGE", "VOLUME", "HIGH", "LOW", "OPENINTEREST"
+    "COLUMNS", "EXPORT", "SHARE", "FEEDBACK", "HELP", "MARKET", "OPENINTEREST"
 ]
 
-# 36 VARIABEL
 COLUMNS_KEYS = [
     "price", "ticks_5m", "change_5m", "volume_5m", "volatility_15m",
     "volume_1h", "vdelta_1h", "oi_change_8h", "change_1d", "funding_rate",
@@ -38,63 +35,66 @@ def init_firebase():
     json_str = os.environ.get("FIREBASE_KEY_JSON")
     if not json_str: return False
     try:
+        cred_dict = json.loads(json_str)
         if not firebase_admin._apps:
-            cred = credentials.Certificate(json.loads(json_str))
+            cred = credentials.Certificate(cred_dict)
             firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
         return True
     except: return False
 
-def run_linux_adaptive():
-    print("🚀 BOT ORION: LINUX ADAPTIVE MODE...")
+def run_extreme_extraction():
+    print("🚀 BOT ORION: EXTREME EXTRACTION MODE (GITHUB ACTIONS)...")
     start_global = time.time()
     
-    if not init_firebase(): return
+    if not init_firebase():
+        print("❌ Firebase Init Failed")
+        return
 
     co = ChromiumOptions()
     co.set_argument('--headless=new')
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
-    co.set_argument('--window-size=1920,1080') # Layar Full HD
+    co.set_argument('--window-size=2560,1440') # Resolusi 2K agar tabel melebar
     co.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     try:
         page = ChromiumPage(addr_or_opts=co)
         page.set.timeouts(page_load=60)
         
-        try: page.get(URL_TARGET)
-        except: pass
+        print(f"🌐 Membuka Target: {URL_TARGET}")
+        page.get(URL_TARGET)
 
-        print("⏳ Menunggu Loading (25 detik)...")
-        time.sleep(25)
+        print("⏳ Menunggu Website Stabil (30 detik)...")
+        time.sleep(30)
         
-        # Validasi Halaman
-        if "Orion" not in page.title:
-            print("❌ Gagal Load (Judul salah).")
-            return
-
-        # Zoom Out
-        try: page.run_js("document.body.style.zoom = '25%'")
+        # Perkecil zoom agar semua kolom ter-render oleh browser
+        try: page.run_js("document.body.style.zoom = '20%'")
         except: pass
 
         ref = db.reference('screener_full_data')
-        print("👀 MONITORING AKTIF...")
+        print("👀 MEMULAI SCANNING MENDALAM...")
 
-        cycle_count = 0
         while True:
             if (time.time() - start_global) > TIMEOUT_LIMIT:
                 print("🏁 Selesai.")
                 break
 
             try:
-                # Scroll
-                page.run_js("window.scrollTo(0, 10000);")
-                time.sleep(0.5)
+                # Manuver Scroll untuk memicu lazy loading data
+                page.run_js("window.scrollTo(0, 5000);")
+                time.sleep(1)
+                page.run_js("window.scrollTo(5000, 0);") # Geser kanan
+                time.sleep(1)
                 page.run_js("window.scrollTo(0, 0);")
-                time.sleep(0.5)
                 
-                # BACA TEXT (Metode InnerText)
+                # METODE SCANNING BARU: Ambil semua teks dari element 'div' 
+                # Ini lebih akurat daripada innerText global di Linux
                 raw_text = page.run_js("return document.body.innerText")
                 lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
+                
+                # Debugging Log singkat
+                if len(lines) > 0:
+                    print(f"📄 Berhasil menangkap {len(lines)} baris teks.")
                 
                 data_batch = {}
                 count = 0
@@ -104,40 +104,32 @@ def run_linux_adaptive():
                 while i < len(lines):
                     line = lines[i]
                     
-                    # LOGIKA CARI KOIN:
-                    # 1. Panjang 2-6 (BTC)
-                    # 2. Huruf Besar Semua
-                    # 3. Tidak ada di Blacklist
-                    # 4. Bukan Angka
+                    # Logika Pencarian Simbol Koin
                     if (2 <= len(line) <= 6 and 
                         line.isalpha() and 
                         line.isupper() and 
                         line not in BLACKLIST):
                         
-                        # VALIDASI GANDA: Cek baris bawahnya
+                        # Pastikan baris berikutnya bukan menu tapi angka/harga
                         if i + 1 < len(lines):
-                            next_line = lines[i+1].replace('$', '').replace(',', '').strip()
+                            next_val = lines[i+1].replace('$', '').replace(',', '').strip()
                             
-                            # Baris bawah HARUS angka (Harga)
-                            # Bisa bentuk: "96000" atau "0.05"
-                            is_number = False
+                            is_valid_coin = False
                             try:
-                                float(next_line)
-                                is_number = True
-                            except: 
-                                is_number = False
+                                float(next_val)
+                                is_valid_coin = True
+                            except:
+                                is_valid_coin = False
                             
-                            if is_number:
-                                # INI KOIN VALID!
+                            if is_valid_coin:
                                 symbol = line
                                 coin_data = {'updated': ts}
                                 
-                                # Ambil data mulai dari i+1
+                                # Ambil 36 variabel ke bawah
                                 data_idx = i + 1
                                 for key in COLUMNS_KEYS:
                                     if data_idx < len(lines):
-                                        val = lines[data_idx]
-                                        coin_data[key] = val
+                                        coin_data[key] = lines[data_idx].strip()
                                         data_idx += 1
                                     else:
                                         coin_data[key] = "-"
@@ -145,9 +137,7 @@ def run_linux_adaptive():
                                 symbol_clean = symbol.replace('.', '_')
                                 data_batch[symbol_clean] = coin_data
                                 count += 1
-                                
-                                # Lompat index
-                                i = data_idx - 1
+                                i = data_idx - 1 # Lompat ke akhir blok data koin ini
                             else:
                                 i += 1
                         else:
@@ -156,29 +146,26 @@ def run_linux_adaptive():
                         i += 1
 
                 if data_batch:
-                    try:
-                        ref.update(data_batch)
-                        print(f"✅ [{ts}] Upload: {count} Koin (Linux)")
-                        sys.stdout.flush()
-                    except: pass
+                    ref.update(data_batch)
+                    print(f"✅ [{ts}] Berhasil Kirim: {count} Koin.")
+                    sys.stdout.flush()
                 else:
-                    # Jika kosong, coba refresh
-                    print("⚠️ Data kosong. Refreshing...")
+                    print("⚠️ Data belum terdeteksi. Mencoba refresh browser...")
                     page.refresh()
                     time.sleep(15)
 
-                cycle_count += 1
-                if cycle_count >= 10: gc.collect(); cycle_count = 0
-                
+                gc.collect()
                 time.sleep(5)
 
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ Kesalahan Loop: {e}")
                 time.sleep(5)
         
         page.quit()
 
-    except Exception: pass
+    except Exception as e:
+        print(f"❌ Error Fatal: {e}")
 
 if __name__ == "__main__":
-    run_linux_adaptive()
+    run_extreme_extraction()
     sys.exit(0)
