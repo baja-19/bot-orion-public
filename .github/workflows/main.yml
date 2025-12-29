@@ -1,0 +1,29 @@
+name: Bot Orion 15 Menit
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # Jalan otomatis setiap 15 menit
+  workflow_dispatch:       # Biar bisa diklik manual
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Siapkan Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@latest
+
+      - name: Install Library
+        run: pip install -r requirements.txt
+
+      - name: Jalankan Script
+        env:
+          FIREBASE_KEY_JSON: ${{ secrets.FIREBASE_KEY_JSON }}
+        run: python bot_cloud.py
