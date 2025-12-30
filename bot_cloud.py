@@ -41,7 +41,7 @@ logging.basicConfig(
 logger = logging.getLogger("Orion-v5.5")
 
 # ==========================================
-# 2. SCHEMA GUARD (UPDATED v5.5)
+# 2. SCHEMA GUARD (PERBAIKAN UTAMA)
 # ==========================================
 class SchemaGuard:
     def __init__(self):
@@ -53,11 +53,15 @@ class SchemaGuard:
     def validate_batch(self, items: List[Tuple[str, Dict]]) -> bool:
         if not items: return True
         
+        # [FIX 1] Konversi ke List untuk menghindari DeprecationWarning
+        # random.sample tidak bisa lagi menerima dict_keys/items di Python 3.9+
+        sample_pool = list(items)
+        
         # Warmup Phase (Belajar struktur data)
         if not self.locked:
             self.cycle_count += 1
             current_batch_keys = set()
-            for _, data in items:
+            for _, data in sample_pool:
                 current_batch_keys.update(data.keys())
             
             if len(current_batch_keys) > len(self.ref_keys):
@@ -69,11 +73,12 @@ class SchemaGuard:
             return True
 
         # Validation Phase
-        sample_size = min(len(items), 5)
-        samples = random.sample(items, sample_size)
+        sample_size = min(len(sample_pool), 5)
+        samples = random.sample(sample_pool, sample_size)
         valid_votes = 0
         
-        # [FIX v5.5] Daftar kunci alternatif yang diterima
+        # [FIX 2] Daftar kunci alternatif (Alias)
+        # Agar tidak false alarm jika Orion ganti 'last_price' jadi 'price'
         possible_tickers = {'ticker', 'symbol', 'pair', 'name'}
         possible_prices = {'last_price', 'price', 'close', 'last', 'p'}
         
@@ -81,13 +86,14 @@ class SchemaGuard:
             keys = set(data.keys())
             
             # Cek apakah minimal ada SATU kunci ticker dan SATU kunci harga
+            # Menggunakan intersection (irisan himpunan)
             has_ticker = bool(keys.intersection(possible_tickers))
             has_price = bool(keys.intersection(possible_prices))
             
             if has_ticker and has_price:
                 valid_votes += 1
             else:
-                # [DEBUG v5.5] Cetak kunci jika gagal, biar kita tau Orion ganti apa
+                # Debugging: Cetak kunci jika gagal, biar kita tau Orion ganti apa
                 if valid_votes == 0: 
                     logger.debug(f"🔍 Failed Sample Keys: {list(keys)}")
         
@@ -276,7 +282,6 @@ class RobustOrionClient:
                 with self._lock:
                     self.session.cookies.clear()
                     self.session.cookies.update(new_cookies)
-                    self.auth_fail_count = 0
                     logger.info("✅ Cookies Hot-Reloaded.")
                 return True
         except: pass
@@ -417,12 +422,12 @@ def run():
             elif isinstance(raw, list):
                 items = [(x.get('ticker', 'UNK'), x) for x in raw]
 
-            # Validate Schema (Relaxed)
+            # Validate Schema (Relaxed & Safe)
+            # Jika gagal validasi, dia hanya akan memberi Warning dan TETAP LANJUT
             schema.validate_batch(items)
 
             # Parse
             market_snapshot = {}
-            fetch_time = datetime.now().isoformat()
             btc_p, eth_p = 0, 0
             all_prices = []
 
@@ -448,7 +453,7 @@ def run():
                 meta_data = {
                     'total_coins': total,
                     'frozen_count': frozen_count,
-                    'ts': fetch_time,
+                    'ts': datetime.now().isoformat(),
                     'schema_v': SCHEMA_VERSION
                 }
                 new_hash = fb.push(market_snapshot, meta_data, state.prev_hash)
