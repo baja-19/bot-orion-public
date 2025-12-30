@@ -1,370 +1,253 @@
 import os
-import json
+import sys
 import time
+import json
 import random
+import requests
+import logging
 import hashlib
 import threading
-import warnings
 from datetime import datetime
-from typing import Dict, List, Optional
-from dataclasses import dataclass
-from enum import Enum
-
-import requests
-import ccxt
-
-warnings.filterwarnings('ignore')
-import logging
-
-# Setup Logging Sederhana
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
-logger = logging.getLogger("SmartBot")
+from typing import List, Dict, Any, Tuple, Optional
 
 # ==========================================
-# 1. KONFIGURASI (WAJIB DIISI)
+# 1. KONFIGURASI GLOBAL
 # ==========================================
-# 🔐 API KEY BITGET
-BITGET_API_KEY = 'bg_816a44ad290443577691a0aa29f70879'
-BITGET_SECRET_KEY = '6005af3430fc476d8bef74be746f29385da8a48749d2fcca2a9eff2033b30209'
-BITGET_PASSPHRASE = 'dzakki04'
+# Masukkan URL Firebase Anda di Environment Variables atau ganti string di bawah
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/")
+INITIAL_COOKIES = os.environ.get("ORION_COOKIES_JSON", "{}") 
 
-# 🔥 FIREBASE
-FIREBASE_ROOT = 'https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/'
-URL_STATUS = FIREBASE_ROOT + 'account_status.json'
-URL_TRADES_BASE = FIREBASE_ROOT + 'trades' 
+# Konfigurasi Interval
+ORION_API_URL = "https://orionterminal.com/api/screener"
+CYCLE_ACTIVE_SEC = 270   # Bot aktif selama 4.5 menit
+CYCLE_PAUSE_SEC = 30     # Istirahat 30 detik untuk menghindari ban IP
+POLL_INTERVAL = 3        # Ambil data setiap 3 detik saat siklus aktif
+DATA_LIMIT = 1000        # Ambil maksimal koin yang tersedia
+MAX_SNAPSHOTS_TO_KEEP = 100 # Simpan 100 data terakhir di Firebase
 
-# ⚙️ SETTING TRADING
-# Ganti ke 'LIVE' jika ingin pakai uang asli, 'DEMO' untuk uang mainan
-TRADING_MODE = "DEMO" 
-
-MODAL_PER_TRADE = 15.0  # USDT
-LEVERAGE = 5
-MAX_POSITIONS = 3
-STOP_LOSS_PCT = 0.015   # 1.5%
-TAKE_PROFIT_RATIO = 2.0 
-
-# Indikator RSI
-RSI_OVERSOLD = 30
-RSI_OVERBOUGHT = 70
-
-# 🌐 ORION CONFIG (COOKIES & HEADERS)
-ORION_URL = 'https://orionterminal.com/api/screener'
-ORION_COOKIES = {
-    '_ga': 'GA1.1.1647406654.1766912547',
-    '_ga_9CYVGBD33S': 'GS2.1.s1766927197$o3$g1$t1766927218$j39$l0$h0'
-}
-ORION_HEADERS = {
-    'accept': 'application/json, text/javascript, */*; q=0.01',
-    'referer': 'https://orionterminal.com/screener',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
-    'x-requested-with': 'XMLHttpRequest',
-}
+# Setup Logging Indonesian
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("Harvester-V5")
 
 # ==========================================
-# 2. SMART DATA PARSER (INTI PERBAIKAN)
+# 2. MESIN INTEGRITAS (CHAINING)
 # ==========================================
-@dataclass
-class CoinData:
-    symbol: str
-    price: float
-    rsi: float
-    
-    @classmethod
-    def parse(cls, ticker_raw: str, data: Dict) -> 'CoinData':
-        """
-        Fungsi pintar untuk mencari data di antara tumpukan kode angka Orion.
-        """
-        # 1. Cari Harga (Prioritas: Key '11', lalu 'last_price', lalu 'price')
-        price = 0.0
-        # List kemungkinan key untuk HARGA
-        price_keys = ['11', 'last_price', 'price', 'close', 'p', 'last']
-        
-        for k in price_keys:
-            val = data.get(k)
-            if val is not None:
-                try:
-                    price = float(val)
-                    if price > 0: break 
-                except: continue
+class IntegrityEngine:
+    def __init__(self, firebase_url):
+        self.firebase_url = firebase_url.rstrip('/')
+        self.prev_hash = self._load_last_hash()
 
-        # 2. Cari RSI (Prioritas: Key '50', lalu 'rsi_14', lalu 'rsi')
-        rsi = 50.0
-        # List kemungkinan key untuk RSI
-        rsi_keys = ['50', 'rsi_14', 'rsi', 'r', '48']
-        
-        for k in rsi_keys:
-            val = data.get(k)
-            if val is not None:
-                try:
-                    r_val = float(val)
-                    if 0 <= r_val <= 100: # RSI harus 0-100
-                        rsi = r_val
-                        break
-                except: continue
-
-        return cls(symbol=ticker_raw, price=price, rsi=rsi)
-
-# ==========================================
-# 3. ORION COLLECTOR
-# ==========================================
-class OrionCollector:
-    def fetch_data(self):
-        print("\n🔍 Mengambil Data Orion...", end="")
+    def _load_last_hash(self) -> str:
+        """Mengambil hash terakhir dari DB agar audit trail tidak putus."""
         try:
-            # Tambahkan parameter sort agar data tidak kosong
-            params = {"limit": 500, "sort": "volume", "order": "desc"}
-            res = requests.get(ORION_URL, params=params, cookies=ORION_COOKIES, headers=ORION_HEADERS, timeout=15)
+            url = f"{self.firebase_url}/orion_snapshots.json?orderBy=\"$key\"&limitToLast=1"
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200 and res.json():
+                last_key = list(res.json().keys())[0]
+                last_data = res.json()[last_key]
+                if '_integrity' in last_data:
+                    h = last_data['_integrity'].get('chain_hash')
+                    logger.info(f"🔗 Melanjutkan rantai data dari hash: {h[:8]}...")
+                    return h
+        except: pass
+        return "0" * 64
+
+    def compute_hashes(self, data: Dict) -> Tuple[str, str]:
+        """Menghasilkan hash data murni dan hash rantai (Blockchain-style)."""
+        data_str = json.dumps(data, sort_keys=True)
+        data_hash = hashlib.sha256(data_str.encode()).hexdigest()
+        chain_hash = hashlib.sha256(f"{self.prev_hash}{data_hash}".encode()).hexdigest()
+        self.prev_hash = chain_hash
+        return data_hash, chain_hash
+
+# ==========================================
+# 3. PEMROSES DATA (CLEANING)
+# ==========================================
+class DataProcessor:
+    @staticmethod
+    def clean_ticker(raw_key: str) -> str:
+        """Membersihkan nama koin: 'BTC/USDT-binance' -> 'BTC'."""
+        return raw_key.split('-')[0].split('/')[0].upper().replace('USDT', '')
+
+    @staticmethod
+    def parse(raw_data: Dict) -> Dict:
+        """Mengekstraksi seluruh field penting dari Orion tanpa filter ketat."""
+        processed = {}
+        fetch_time = datetime.now().isoformat()
+
+        # Handle format data Orion (Bisa Dict atau List)
+        items = []
+        if isinstance(raw_data, dict):
+            items = raw_data.items()
+        elif isinstance(raw_data, list):
+            items = [(x.get('ticker', 'UNK'), x) for x in raw_data]
+
+        for k, v in items:
+            try:
+                symbol = DataProcessor.clean_ticker(str(k))
+                if symbol in ['USDT', 'USDC', 'DAI', 'BGB']: continue
+                
+                # Ambil semua data numerik yang tersedia
+                processed[symbol] = {
+                    'price': float(v.get('11') or v.get('last_price') or v.get('price') or 0),
+                    'vol_24h': float(v.get('10') or v.get('volume_24h') or v.get('volume') or 0),
+                    'change_24h': float(v.get('6') or v.get('change_24h') or v.get('change') or 0),
+                    'rsi': float(v.get('rsi') or v.get('rsi_14') or 50),
+                    'funding': float(v.get('funding_rate') or v.get('funding') or 0),
+                    'oi': float(v.get('oi') or v.get('open_interest') or 0),
+                    'ts': fetch_time
+                }
+            except: continue
             
+        return processed
+
+# ==========================================
+# 4. KONEKSI & SELF-HEALING
+# ==========================================
+class OrionScraper:
+    def __init__(self, firebase_url):
+        self.session = requests.Session()
+        self.fb_url = firebase_url.rstrip('/')
+        self._setup_headers()
+        self._load_initial_cookies()
+
+    def _setup_headers(self):
+        self.session.headers.update({
+            'accept': 'application/json',
+            'referer': 'https://orionterminal.com/screener',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'x-requested-with': 'XMLHttpRequest'
+        })
+
+    def _load_initial_cookies(self):
+        try:
+            cookies = json.loads(INITIAL_COOKIES)
+            self.session.cookies.update(cookies)
+        except: pass
+
+    def scavenge_cookies(self) -> bool:
+        """Mencoba memuat cookie baru dari Firebase jika kena blokir."""
+        logger.warning("🔄 Mendeteksi blokir (403). Mencoba ambil cookie baru dari Firebase...")
+        try:
+            res = requests.get(f"{self.fb_url}/config/orion_cookies.json", timeout=10)
+            if res.status_code == 200 and res.json():
+                self.session.cookies.update(res.json())
+                logger.info("✅ Cookie berhasil diperbarui secara otomatis.")
+                return True
+        except: pass
+        return False
+
+    def fetch_all(self) -> Optional[Dict]:
+        """Mengambil data mentah dari Orion."""
+        params = {"limit": DATA_LIMIT, "sort": "volume", "order": "desc"}
+        try:
+            res = self.session.get(ORION_API_URL, params=params, timeout=15)
             if res.status_code == 200:
-                raw = res.json()
-                market_map = {}
-                
-                # Handle format List atau Dict
-                items = []
-                if isinstance(raw, dict):
-                    if 'data' in raw: items = [(x.get('ticker'), x) for x in raw['data']]
-                    else: items = raw.items()
-                elif isinstance(raw, list):
-                    items = [(x.get('ticker'), x) for x in raw]
-
-                count = 0
-                for key, val in items:
-                    try:
-                        # Bersihkan Ticker
-                        t_raw = val.get('ticker') or key
-                        if not t_raw: continue
-                        
-                        # Ambil bagian depan sebelum '/' atau '-'
-                        if '/' in str(t_raw): base = str(t_raw).split('/')[0]
-                        elif '-' in str(t_raw): base = str(t_raw).split('-')[0]
-                        else: base = str(t_raw)
-                        
-                        clean_ticker = base.upper().replace('USDT', '')
-                        
-                        # Parse menggunakan Smart Parser
-                        coin_obj = CoinData.parse(clean_ticker, val)
-                        
-                        if coin_obj.price > 0:
-                            market_map[clean_ticker] = coin_obj
-                            count += 1
-                    except: continue
-                
-                print(f" ✅ Sukses: {count} koin terpindai.")
-                return market_map
-            
-            print(f" ❌ Gagal (Status: {res.status_code})")
-            return {}
-        except Exception as e:
-            print(f" ❌ Error Koneksi: {e}")
-            return {}
+                return res.json()
+            elif res.status_code in [403, 401]:
+                if self.scavenge_cookies():
+                    return self.fetch_all() # Retry
+            return None
+        except: return None
 
 # ==========================================
-# 4. FIREBASE & UTILS
+# 5. FIREBASE WRITER
 # ==========================================
-class FirebaseManager:
-    def generate_id(self, symbol, side):
-        return hashlib.md5(f"{symbol}{side}{time.time()}".encode()).hexdigest()[:12]
+class FirebaseWriter:
+    def __init__(self, db_url):
+        self.db_url = db_url.rstrip('/')
 
-    def log_trade(self, data):
-        try:
-            url = f"{URL_TRADES_BASE}/{data['id']}.json"
-            requests.patch(url, json=data, timeout=5)
-        except: pass
-
-    def stream_status(self, exchange):
-        try:
-            bal = exchange.fetch_balance()
-            # Cek USDT atau SUSD
-            eq = float(bal.get('total', {}).get('USDT', 0))
-            if eq == 0: eq = float(bal.get('total', {}).get('SUSD', 0))
-            
-            pos = exchange.fetch_positions()
-            active_list = []
-            pnl_total = 0
-
-            for p in pos:
-                if float(p.get('contracts', 0)) > 0:
-                    pnl_total += float(p['unrealizedPnl'])
-                    active_list.append({
-                        "symbol": p['symbol'], "side": p['side'], "pnl": float(p['unrealizedPnl']),
-                        "entry": float(p['entryPrice']), "roe": float(p['percentage'])
-                    })
-
-            requests.put(URL_STATUS, json={
-                "equity": eq, "pnl_floating": pnl_total,
-                "positions": active_list, "last_update": datetime.now().strftime("%H:%M:%S")
-            }, timeout=3)
-        except: pass
-
-# ==========================================
-# 5. TRADING ENGINE
-# ==========================================
-class TradingBot:
-    def __init__(self):
-        self.orion = OrionCollector()
-        self.firebase = FirebaseManager()
-        self.exchange = None
-        self.active_monitors = []
-        # Watchlist Top Coins
-        self.watchlist = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'DOT', 'LINK', 'DOGE', 'MATIC']
-
-    def connect(self):
-        try:
-            self.exchange = ccxt.bitget({
-                'apiKey': BITGET_API_KEY, 'secret': BITGET_SECRET_KEY, 'password': BITGET_PASSPHRASE,
-                'options': {'defaultType': 'swap'}
-            })
-            if TRADING_MODE == 'DEMO': 
-                self.exchange.set_sandbox_mode(True)
-                logger.info("🔧 MODE: DEMO (SANDBOX)")
-            
-            self.exchange.load_markets()
-            logger.info("✅ Exchange Connected!")
-        except Exception as e:
-            logger.error(f"❌ Gagal Connect: {e}")
-            sys.exit()
-
-    def run(self):
-        self.connect()
+    def push_snapshot(self, market_data: Dict, integrity: Tuple[str, str]):
+        if not market_data: return
         
-        # Background Stream
-        def bg_stream():
-            while True:
-                self.firebase.stream_status(self.exchange)
-                time.sleep(5)
-        threading.Thread(target=bg_stream, daemon=True).start()
-
-        logger.info("🚀 Bot Berjalan... Menunggu Sinyal RSI...")
+        ts_key = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        data_hash, chain_hash = integrity
         
-        cooldowns = {}
-        
-        while True:
-            try:
-                # 1. Ambil Data Market
-                market_data = self.orion.fetch_data()
-                if not market_data:
-                    time.sleep(5); continue
-
-                # 2. Cek Watchlist
-                for coin in self.watchlist:
-                    # Mapping Nama (Orion -> Bitget)
-                    search_key = coin
-                    bitget_symbol = f"{coin}/USDT:USDT"
-                    
-                    if coin == 'MATIC': 
-                        # Update: Bitget pakai POL, Orion mungkin masih MATIC
-                        bitget_symbol = "POL/USDT:USDT"
-
-                    data = market_data.get(search_key)
-                    
-                    # Jika data tidak ketemu, skip
-                    if not data: continue 
-
-                    # Cek RSI
-                    rsi = data.rsi
-                    price = data.price
-                    
-                    signal = None
-                    if rsi > 0 and rsi < RSI_OVERSOLD:
-                        signal = 'buy'
-                        reason = f"RSI Oversold ({rsi:.1f})"
-                    elif rsi > RSI_OVERBOUGHT:
-                        signal = 'sell'
-                        reason = f"RSI Overbought ({rsi:.1f})"
-
-                    # Eksekusi
-                    if signal:
-                        # Cek Cooldown (Jangan beli coin yg sama dlm 5 menit)
-                        if (time.time() - cooldowns.get(coin, 0)) > 300:
-                            # Cek Slot
-                            if len(self.active_monitors) < MAX_POSITIONS:
-                                self.execute_trade(bitget_symbol, signal, price, reason)
-                                cooldowns[coin] = time.time()
-                            else:
-                                logger.info(f"⚠️ Slot Penuh. Skip {coin}")
-                        else:
-                            # logger.info(f"⏳ Cooldown: {coin}")
-                            pass
-
-                time.sleep(10 + random.randint(1, 5))
-
-            except KeyboardInterrupt: sys.exit()
-            except Exception as e:
-                logger.error(f"Loop Error: {e}")
-                time.sleep(10)
-
-    def execute_trade(self, symbol, side, price, reason):
-        logger.info(f"\n🔥 SIGNAL: {symbol} [{side.upper()}] | {reason}")
-        try:
-            # 1. Leverage
-            try: self.exchange.set_leverage(LEVERAGE, symbol)
-            except: pass
-            
-            # 2. Hitung Size
-            # Minimal order bitget biasanya $5. Kita pakai buffer modal per trade.
-            amount = (MODAL_PER_TRADE * LEVERAGE) / price
-            
-            # 3. Market Order
-            order = self.exchange.create_order(symbol, 'market', side, amount)
-            logger.info(f"✅ Order Terkirim! ID: {order['id']}")
-            
-            # 4. Log Firebase
-            tid = self.firebase.generate_id(symbol, side)
-            trade_data = {
-                "id": tid, "symbol": symbol, "dir": side.upper(), "entry": price,
-                "size": amount, "leverage": LEVERAGE, "status": "OPEN",
-                "note": reason, "date": datetime.now().isoformat()
+        payload = {
+            "market": market_data,
+            "_integrity": {
+                "hash": data_hash,
+                "chain_hash": chain_hash,
+                "count": len(market_data),
+                "server_ts": time.time()
             }
-            self.firebase.log_trade(trade_data)
-            
-            # 5. Monitor Thread
-            t = threading.Thread(target=self.monitor_position, args=(symbol, side, price, amount, tid))
-            t.daemon = True
-            t.start()
-            self.active_monitors.append(tid)
-            
+        }
+        
+        try:
+            res = requests.put(f"{self.db_url}/orion_snapshots/{ts_key}.json", json=payload, timeout=10)
+            if res.status_code == 200:
+                logger.info(f"✅ Data Terkirim: {ts_key} | Koin: {len(market_data)} | Hash: {chain_hash[:8]}")
+                self.cleanup()
         except Exception as e:
-            logger.error(f"❌ Gagal Eksekusi: {e}")
+            logger.error(f"❌ Gagal kirim ke Firebase: {e}")
 
-    def monitor_position(self, symbol, side, entry, amount, tid):
-        # Hitung TP/SL
-        tp = entry * (1 + STOP_LOSS_PCT * TAKE_PROFIT_RATIO) if side == 'buy' else entry * (1 - STOP_LOSS_PCT * TAKE_PROFIT_RATIO)
-        sl = entry * (1 - STOP_LOSS_PCT) if side == 'buy' else entry * (1 + STOP_LOSS_PCT)
-        
-        logger.info(f"👀 Monitoring {symbol}... TP:{tp:.4f} SL:{sl:.4f}")
-        
-        start = time.time()
-        while (time.time() - start) < 1800: # Max 30 menit
-            try:
-                ticker = self.exchange.fetch_ticker(symbol)
-                curr = ticker['last']
-                
-                close = False
-                reason = ""
-                
-                if side == 'buy':
-                    if curr >= tp: close=True; reason="Take Profit"
-                    elif curr <= sl: close=True; reason="Stop Loss"
-                else:
-                    if curr <= tp: close=True; reason="Take Profit"
-                    elif curr >= sl: close=True; reason="Stop Loss"
-                
-                if close:
-                    c_side = 'sell' if side == 'buy' else 'buy'
-                    self.exchange.create_order(symbol, 'market', c_side, amount)
-                    
-                    self.firebase.log_trade({
-                        "id": tid, "status": "CLOSED", "exit_price": curr,
-                        "close_reason": reason, "exit_time": datetime.now().isoformat()
-                    })
-                    logger.info(f"🎯 CLOSED {symbol}: {reason}")
-                    break
-                time.sleep(2)
-            except: time.sleep(5)
+    def cleanup(self):
+        """Menghapus data lama agar Firebase tidak bengkak."""
+        try:
+            res = requests.get(f"{self.db_url}/orion_snapshots.json?shallow=true", timeout=5)
+            if res.status_code != 200: return
             
-        if tid in self.active_monitors:
-            self.active_monitors.remove(tid)
+            keys = sorted(list(res.json().keys()))
+            if len(keys) > MAX_SNAPSHOTS_TO_KEEP:
+                to_delete = keys[:-MAX_SNAPSHOTS_TO_KEEP]
+                for k in to_delete[:5]: # Hapus 5 sekaligus
+                    requests.delete(f"{self.db_url}/orion_snapshots/{k}.json")
+        except: pass
+
+# ==========================================
+# 🚀 MAIN LOOP (SINKRONISASI)
+# ==========================================
+def start_harvester():
+    if not FIREBASE_DB_URL:
+        logger.critical("🔥 Error: FIREBASE_DB_URL belum diatur!")
+        return
+
+    scraper = OrionScraper(FIREBASE_DB_URL)
+    writer = FirebaseWriter(FIREBASE_DB_URL)
+    integrity = IntegrityEngine(FIREBASE_DB_URL)
+    
+    logger.info("🚀 ORION DATA HARVESTER v5.2 DIMULAI")
+    
+    while True:
+        cycle_start = time.time()
+        logger.info("🟢 Memulai Siklus Pengambilan Data...")
+
+        while (time.time() - cycle_start) < CYCLE_ACTIVE_SEC:
+            loop_start = time.time()
+            
+            # 1. Ambil Data Mentah
+            raw = scraper.fetch_all()
+            
+            if raw:
+                # 2. Proses & Bersihkan
+                clean_data = DataProcessor.parse(raw)
+                
+                if len(clean_data) > 50: # Validasi minimal koin
+                    # 3. Hitung Hash Integritas
+                    hashes = integrity.compute_hashes(clean_data)
+                    
+                    # 4. Kirim ke Firebase
+                    writer.push_snapshot(clean_data, hashes)
+                else:
+                    logger.warning(f"⚠️ Data terlalu sedikit ({len(clean_data)}), melewati snapshot ini.")
+            else:
+                logger.error("❌ Gagal mendapatkan data dari Orion Terminal.")
+
+            # Jeda antar request
+            elapsed = time.time() - loop_start
+            time.sleep(max(0, POLL_INTERVAL - elapsed))
+
+        logger.info(f"⏸️ Siklus Selesai. Istirahat {CYCLE_PAUSE_SEC}s untuk keamanan IP...")
+        time.sleep(CYCLE_PAUSE_SEC)
 
 if __name__ == "__main__":
-    bot = TradingBot()
-    bot.run()
+    try:
+        start_harvester()
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot dihentikan manual.")
+    except Exception as e:
+        logger.critical(f"💀 CRASH FATAL: {e}")
