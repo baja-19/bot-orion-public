@@ -26,6 +26,13 @@ COLUMNS_KEYS = [
     "vdelta_1d", "vdelta_5m", "vdelta_8h", "volume_15m", "volume_1d", "volume_8h"
 ]
 
+# Daftar kata yang harus diabaikan (Bukan koin)
+BLACKLIST = [
+    "SCREENER", "ALERTS", "CHARTS", "CLI", "SYMBOL", "PRICE", "TICKS", "CHANGE", 
+    "VOLUME", "VOLATILITY", "VDELTA", "OI", "FUNDING", "OPENINTEREST", "MARKETCAP",
+    "ORION", "TERMINAL", "LOGIN", "SIGNUP", "SETTINGS", "PORTFOLIO", "CONNECT"
+]
+
 def init_firebase():
     json_str = os.environ.get("FIREBASE_KEY_JSON")
     if not json_str: return False
@@ -37,8 +44,15 @@ def init_firebase():
         return True
     except: return False
 
+def is_numeric_line(text):
+    """Mengecek apakah baris ini berisi data angka (ciri data koin)"""
+    clean = text.replace('$', '').replace(',', '').replace('%', '').replace('+', '').replace('-', '').replace('.', '').strip()
+    if not clean: return False
+    # Jika baris mengandung banyak angka, berarti ini baris data
+    return sum(c.isdigit() for c in clean) > 3
+
 def run_ghost_bypass():
-    print("🔥 INITIALIZING ORION GHOST BYPASS v2.0...")
+    print("🔥 INITIALIZING ORION GHOST BYPASS v2.1 (ADAPTIVE PARSING)...")
     start_global = time.time()
     
     if not init_firebase():
@@ -50,9 +64,7 @@ def run_ghost_bypass():
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
     co.set_argument('--disable-dev-shm-usage')
-    # Resolusi Super Lebar agar tabel tidak tertekuk
     co.set_argument('--window-size=3840,2160')
-    # Menyamar sebagai Browser User sungguhan
     co.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
 
     try:
@@ -61,55 +73,32 @@ def run_ghost_bypass():
         
         print(f"🌐 ATTACKING TARGET: {URL_TARGET}")
         page.get(URL_TARGET)
-
-        # Tunggu Rendering Pertama
         time.sleep(25)
         
         # Deteksi Cloudflare
         title = page.title
-        print(f"🏷️ PAGE TITLE: {title}")
         if "Just a moment" in title or "Security" in title:
-            print("🚨 CLOUDFLARE DETECTED! GitHub IP is blocked. Trying to refresh...")
+            print("🚨 CLOUDFLARE DETECTED! Refreshing...")
             page.refresh()
             time.sleep(20)
 
-        # Perkecil Zoom secara sistemis
         page.run_js("document.body.style.zoom = '10%'")
         
         ref = db.reference('screener_full_data')
         status_ref = db.reference('bot_status')
 
-        print("👀 STARTING DEEP DATA EXTRACTION...")
+        print("👀 STARTING ADAPTIVE EXTRACTION...")
 
         while True:
             if (time.time() - start_global) > TIMEOUT_LIMIT:
-                print("🏁 SESSION TIMEOUT - EXITING GRACEFULLY")
+                print("🏁 SESSION TIMEOUT - EXITING")
                 break
 
             try:
-                # Manuver Scroll Gila (Untuk memicu data Lazy Loading)
-                for i in range(3):
-                    page.run_js(f"window.scrollTo(0, {i * 2000});")
-                    time.sleep(0.5)
-                
-                # JAVASCRIPT INJECTION: Ekstraksi data langsung dari DOM Tree
-                # Ini jauh lebih akurat daripada membaca teks biasa
-                js_script = """
-                let results = [];
-                let divs = Array.from(document.querySelectorAll('div'));
-                // Cari elemen yang berisi teks kapital (BTC, ETH, dll)
-                divs.forEach(d => {
-                    let txt = d.innerText ? d.innerText.trim() : "";
-                    if (txt.length >= 2 && txt.length <= 6 && /^[A-Z0-9]+$/.test(txt)) {
-                        // Jika ketemu simbol koin, ambil 36 data berikutnya yang ada di sekitar
-                        let parent = d.parentElement;
-                        if(parent) {
-                            results.push(parent.innerText);
-                        }
-                    }
-                });
-                return results;
-                """
+                page.run_js("window.scrollTo(0, 5000);")
+                time.sleep(1)
+                page.run_js("window.scrollTo(0, 0);")
+                time.sleep(1)
                 
                 raw_extracted = page.run_js("return document.body.innerText")
                 lines = [l.strip() for l in raw_extracted.split('\n') if l.strip()]
@@ -118,38 +107,41 @@ def run_ghost_bypass():
                 count = 0
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                # LOGIKA PARSING ADAPTIF
+                # LOGIKA PARSING BARU: Mendeteksi koin yang simbol dan datanya terpisah baris
                 i = 0
                 while i < len(lines):
                     line = lines[i]
-                    # Syarat Koin: Huruf Besar, 2-6 karakter, bukan kata menu umum
-                    if (2 <= len(line) <= 6 and line.isupper() and line.isalpha() and 
-                        line not in ["HOME", "PRICE", "VOL", "TOTAL", "OPEN"]):
+                    
+                    # 1. Deteksi Simbol (Harus mengandung huruf besar, minimal 2 karakter, tidak di blacklist)
+                    if (len(line) >= 2 and any(c.isalpha() for c in line) and 
+                        line.isupper() and line not in BLACKLIST):
                         
-                        # Cek apakah baris berikutnya adalah harga (mengandung angka/$)
+                        # 2. Lihat baris berikutnya, apakah berisi kumpulan angka?
                         if i + 1 < len(lines):
                             next_line = lines[i+1]
-                            if any(c.isdigit() for c in next_line) or "$" in next_line:
-                                # KOIN VALID DITEMUKAN
+                            
+                            if is_numeric_line(next_line):
+                                # INI ADALAH BARIS DATA KOIN VALID
                                 symbol = line
+                                # Pecah baris data menjadi list berdasarkan spasi/tab
+                                values = next_line.split()
+                                
                                 coin_data = {'updated': ts}
                                 
-                                # Sedot 36 variabel
-                                data_idx = i + 1
-                                for key in COLUMNS_KEYS:
-                                    if data_idx < len(lines):
-                                        coin_data[key] = lines[data_idx].strip()
-                                        data_idx += 1
+                                # Masukkan ke 36 variabel
+                                for idx, key in enumerate(COLUMNS_KEYS):
+                                    if idx < len(values):
+                                        coin_data[key] = values[idx].strip()
                                     else:
                                         coin_data[key] = "-"
                                 
-                                symbol_clean = symbol.replace('.', '_')
-                                data_batch[symbol_clean] = coin_data
+                                # Bersihkan Simbol untuk Firebase path
+                                sym_clean = symbol.replace('.', '_').replace('/', '_').replace('$', '')
+                                data_batch[sym_clean] = coin_data
                                 count += 1
-                                i = data_idx - 1
-                            else: i += 1
-                        else: i += 1
-                    else: i += 1
+                                i += 1 # Loncat karena baris i+1 sudah diproses
+                        
+                    i += 1
 
                 if data_batch:
                     ref.update(data_batch)
@@ -162,14 +154,12 @@ def run_ghost_bypass():
                     print(f"✅ [{ts}] SUCCESS: Extracted {count} coins.")
                     sys.stdout.flush()
                 else:
-                    print(f"⚠️ [{ts}] ZERO ROWS: Page content might be blocked or empty.")
-                    # Jika zonk, ambil screenshot mini (log as text)
-                    print(f"📄 DEBUG CONTENT: {raw_extracted[:300]}...")
-                    # Coba paksa scroll ulang
-                    page.run_js("window.scrollTo(0, document.body.scrollHeight);")
+                    print(f"⚠️ [{ts}] ZERO ROWS: Format data berubah atau halaman belum muat.")
+                    if len(lines) > 10:
+                        print(f"📄 PREVIEW 5 BARIS PERTAMA: {lines[:5]}")
 
                 gc.collect()
-                time.sleep(10)
+                time.sleep(15)
 
             except Exception as e:
                 print(f"❌ LOOP ERROR: {e}")
