@@ -1,29 +1,31 @@
-name: Bot Orion 15 Menit
+name: Run Trading Bot
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # Jalan otomatis setiap 15 menit
-  workflow_dispatch:       # Biar bisa diklik manual
+    - cron: '*/5 * * * *' # Jalan tiap 5 menit
+  workflow_dispatch:      # Tombol run manual
 
 jobs:
-  run-bot:
+  build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-      - name: Siapkan Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@latest
+      # 👇 TAMBAHKAN BAGIAN INI 👇
+      - name: Install Libraries
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt requests numpy pandas
 
-      - name: Install Library
-        run: pip install -r requirements.txt
-
-      - name: Jalankan Script
+      - name: Run Bot
         env:
-          FIREBASE_KEY_JSON: ${{ secrets.FIREBASE_KEY_JSON }}
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+          ORION_COOKIES_JSON: ${{ secrets.ORION_COOKIES_JSON }}
         run: python bot_cloud.py
