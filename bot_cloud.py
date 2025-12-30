@@ -13,10 +13,15 @@ from collections import deque
 from typing import List, Dict, Any, Tuple, Optional, Set
 
 # ==========================================
-# 1. KONFIGURASI GLOBAL
+# 1. KONFIGURASI GLOBAL (SUDAH DIISI)
 # ==========================================
-FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL")
-INITIAL_COOKIES = os.environ.get("ORION_COOKIES_JSON", "{}") 
+
+# ✅ URL Firebase Anda (Langsung dimasukkan agar tidak error)
+FIREBASE_DB_URL = "https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+# Cookie Awal (Wajib diupdate lewat Firebase / Hardcode disini jika mau)
+# Jika kosong, bot akan mencoba mengambil dari Firebase Config nanti
+INITIAL_COOKIES = os.environ.get("ORION_COOKIES_JSON", '{"_ga": "GA1.1.1647406654.1766912547"}')
 
 # Internal Config
 ORION_API_URL = "https://orionterminal.com/api/screener"
@@ -25,11 +30,9 @@ CYCLE_PAUSE_SEC = 30
 POLL_INTERVAL = 3        
 DATA_LIMIT = 1000
 MAX_SNAPSHOTS_TO_KEEP = 48
-SCHEMA_VERSION = "5.5.0"
+SCHEMA_VERSION = "5.6.0"
 ROUNDING_PRECISION = 8  
 MAX_AUTH_RETRIES = 5    
-
-# Memory Limits
 MAX_MEMORY_KEYS = 2000 
 FREEZE_THRESHOLD_PCT = 0.2
 
@@ -38,10 +41,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("Orion-v5.5")
+logger = logging.getLogger("Orion-v5.6")
 
 # ==========================================
-# 2. SCHEMA GUARD (PERBAIKAN UTAMA)
+# 2. SCHEMA GUARD
 # ==========================================
 class SchemaGuard:
     def __init__(self):
@@ -52,12 +55,8 @@ class SchemaGuard:
         
     def validate_batch(self, items: List[Tuple[str, Dict]]) -> bool:
         if not items: return True
-        
-        # [FIX 1] Konversi ke List untuk menghindari DeprecationWarning
-        # random.sample tidak bisa lagi menerima dict_keys/items di Python 3.9+
         sample_pool = list(items)
         
-        # Warmup Phase (Belajar struktur data)
         if not self.locked:
             self.cycle_count += 1
             current_batch_keys = set()
@@ -72,41 +71,28 @@ class SchemaGuard:
                 logger.info(f"🛡️ Schema Locked. Known fields: {list(self.ref_keys)[:5]}...")
             return True
 
-        # Validation Phase
         sample_size = min(len(sample_pool), 5)
         samples = random.sample(sample_pool, sample_size)
         valid_votes = 0
-        
-        # [FIX 2] Daftar kunci alternatif (Alias)
-        # Agar tidak false alarm jika Orion ganti 'last_price' jadi 'price'
         possible_tickers = {'ticker', 'symbol', 'pair', 'name'}
         possible_prices = {'last_price', 'price', 'close', 'last', 'p'}
         
         for _, data in samples:
             keys = set(data.keys())
-            
-            # Cek apakah minimal ada SATU kunci ticker dan SATU kunci harga
-            # Menggunakan intersection (irisan himpunan)
             has_ticker = bool(keys.intersection(possible_tickers))
             has_price = bool(keys.intersection(possible_prices))
-            
             if has_ticker and has_price:
                 valid_votes += 1
             else:
-                # Debugging: Cetak kunci jika gagal, biar kita tau Orion ganti apa
-                if valid_votes == 0: 
-                    logger.debug(f"🔍 Failed Sample Keys: {list(keys)}")
+                if valid_votes == 0: logger.debug(f"🔍 Failed Keys: {list(keys)}")
         
         if valid_votes / sample_size < 0.5:
-            # Downgrade dari CRITICAL ke WARNING agar bot tidak panik berlebihan
-            # selama data masih terkirim (Pushed: OK)
-            logger.warning(f"⚠️ Partial Schema Drift! Valid: {valid_votes}/{sample_size}. (Check Debug Log)")
-            return True # Tetap lanjut (Allow) karena Parser utama lebih pintar
-            
+            logger.warning(f"⚠️ Partial Schema Drift! Valid: {valid_votes}/{sample_size}.")
+            return True 
         return True
 
 # ==========================================
-# 3. STATE & INTEGRITY ENGINE
+# 3. STATE & INTEGRITY
 # ==========================================
 class StateTracker:
     def __init__(self, firebase_url):
@@ -132,14 +118,12 @@ class StateTracker:
     def check_soft_freeze_and_gc(self, current_snapshot: Dict) -> int:
         frozen_count = 0
         current_keys = set(current_snapshot.keys())
-        
         for symbol, data in current_snapshot.items():
             price = data['price']
             if symbol not in self.price_memory:
                 self.price_memory[symbol] = deque(maxlen=self.max_memory)
             mem = self.price_memory[symbol]
             mem.append(price)
-            
             if len(mem) == self.max_memory:
                 min_p, max_p = min(mem), max(mem)
                 if (max_p - min_p) < self.epsilon:
@@ -161,11 +145,9 @@ class MarketStats:
         
     def update_and_validate(self, btc_p: float, eth_p: float, all_prices: List[float]) -> bool:
         current_median = statistics.median(all_prices) if all_prices else 0
-        
         if btc_p > 0: self.btc_hist.append(btc_p)
         if eth_p > 0: self.eth_hist.append(eth_p)
         if current_median > 0: self.global_median_hist.append(current_median)
-        
         if len(self.btc_hist) < 3: return True 
         
         anomalies = 0
@@ -180,12 +162,12 @@ class MarketStats:
             if glob_med > 0 and abs(current_median - glob_med) / glob_med > 0.3: anomalies += 1
             
         if anomalies >= 2:
-            logger.error(f"📉 MARKET DATA ANOMALY! Flags: {anomalies}/3")
+            logger.error(f"📉 MARKET ANOMALY (Flags: {anomalies}/3)")
             return False
         return True
 
 # ==========================================
-# 4. INTELLIGENT PARSER
+# 4. PARSER
 # ==========================================
 class DataParser:
     SCHEMA_MAP = {
@@ -196,26 +178,22 @@ class DataParser:
         'funding':      ['funding_rate', 'funding', 0.0],
         'oi':           ['open_interest', 'oi', 0.0]
     }
-
     @staticmethod
     def _extract_heuristic(raw_data: Dict, keys: List[Any], field_type: str) -> float:
         default = keys[-1]
         for k in keys[:-1]:
             if k not in raw_data: continue
             val = raw_data[k]
-            
             if isinstance(val, list):
                 if not val: return float(default)
                 nums = [v for v in val if isinstance(v, (int, float))]
                 if not nums: return float(default)
-                
                 chosen = nums[0]
                 if field_type == 'volume': chosen = max(nums)
                 elif field_type == 'percent':
                      candidates = [n for n in nums if -100 <= n <= 100]
                      chosen = candidates[0] if candidates else nums[0]
                 return float(chosen)
-
             try:
                 if val is None: continue
                 return float(val)
@@ -229,15 +207,13 @@ class DataParser:
             ftype = 'volume' if 'volume' in out_key else ('percent' if 'change' in out_key or 'funding' in out_key else 'price')
             val = DataParser._extract_heuristic(raw_data, mapping, ftype)
             clean[out_key] = val
-        
         if clean['price'] <= 0: return None
-        
         raw_lower = raw_key.lower()
         clean['type'] = 'futures' if ('perp' in raw_lower or 'usdm' in raw_lower or clean['funding'] != 0) else 'spot'
         return clean
 
 # ==========================================
-# 5. ROBUST NETWORK CLIENT
+# 5. NETWORK CLIENT
 # ==========================================
 class RobustOrionClient:
     def __init__(self, firebase_url):
@@ -262,26 +238,15 @@ class RobustOrionClient:
             self.session.cookies.update(cookies)
         except: pass
 
-    def _validate_cookies(self, cookies: Dict) -> bool:
-        try:
-            test_url = f"{ORION_API_URL}?limit=1"
-            res = requests.get(test_url, cookies=cookies, headers=self.session.headers, timeout=5)
-            return res.status_code == 200
-        except: return False
-
     def _scavenge_cookies(self) -> bool:
-        logger.info("♻️ Scavenging cookies...")
+        logger.info("♻️ Scavenging cookies from Firebase...")
         try:
             url = f"{self.firebase_url}/config/orion_cookies.json"
             res = requests.get(url, timeout=10)
             if res.status_code == 200 and res.json():
-                new_cookies = res.json()
-                if not self._validate_cookies(new_cookies):
-                    logger.warning("⚠️ Scavenged cookies are INVALID.")
-                    return False
                 with self._lock:
                     self.session.cookies.clear()
-                    self.session.cookies.update(new_cookies)
+                    self.session.cookies.update(res.json())
                     logger.info("✅ Cookies Hot-Reloaded.")
                 return True
         except: pass
@@ -300,25 +265,19 @@ class RobustOrionClient:
             try:
                 with self._lock:
                     res = self.session.get(ORION_API_URL, params=params, timeout=20)
-                
                 if res.status_code == 429:
-                    time.sleep(int(res.headers.get("Retry-After", 30)))
-                    continue
-
+                    time.sleep(30); continue
                 if res.status_code in [403, 401]:
                     self.auth_fail_count += 1
                     logger.warning(f"⛔ Auth Failed ({self.auth_fail_count}).")
                     if self._scavenge_cookies():
                         time.sleep(2); continue
                     return {}, "AUTH_DEAD"
-                
                 if res.status_code == 200:
                     self.auth_fail_count = 0
                     return res.json(), "OK"
-                
                 if res.status_code >= 500:
                     time.sleep(backoff); backoff *= 2; continue
-
             except: time.sleep(backoff)
         return {}, "FAIL"
 
@@ -356,7 +315,6 @@ class SecureFirebaseClient:
                 "ts_iso": datetime.now().isoformat()
             }
         }
-
         ts_key = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         url = f"{self.db_url}/orion_snapshots/{ts_key}.json"
         
@@ -369,8 +327,6 @@ class SecureFirebaseClient:
                     return chain_hash
                 time.sleep(1)
             except: pass
-        
-        logger.error("❌ Push Failed after retries")
         return prev_hash
 
     def cleanup(self):
@@ -385,20 +341,16 @@ class SecureFirebaseClient:
         except: pass
 
 # ==========================================
-# 7. MAIN ORCHESTRATOR
+# 7. MAIN RUN
 # ==========================================
 def run():
-    if not FIREBASE_DB_URL:
-        logger.critical("🔥 MISSING ENV: FIREBASE_DB_URL")
-        return
-
     client = RobustOrionClient(FIREBASE_DB_URL)
     fb = SecureFirebaseClient(FIREBASE_DB_URL)
     schema = SchemaGuard()
     stats = MarketStats()
     state = StateTracker(FIREBASE_DB_URL)
     
-    logger.info(f"🚀 HARVESTER v5.5 STARTED | Chain: {state.prev_hash[:8]}")
+    logger.info(f"🚀 ENGINE v5.6 STARTED | Chain: {state.prev_hash[:8]}")
 
     while True:
         cycle_start = time.time()
@@ -406,14 +358,13 @@ def run():
 
         while (time.time() - cycle_start) < CYCLE_ACTIVE_SEC:
             loop_s = time.time()
-            
             raw, status = client.fetch()
+            
             if status == "AUTH_DEAD":
                 logger.critical("💀 AUTH DEAD. Waiting..."); time.sleep(15); continue
             if not raw:
                 time.sleep(POLL_INTERVAL); continue
 
-            # Standardize List/Dict
             items = []
             if isinstance(raw, dict):
                 if 'data' in raw and isinstance(raw['data'], list):
@@ -422,11 +373,7 @@ def run():
             elif isinstance(raw, list):
                 items = [(x.get('ticker', 'UNK'), x) for x in raw]
 
-            # Validate Schema (Relaxed & Safe)
-            # Jika gagal validasi, dia hanya akan memberi Warning dan TETAP LANJUT
             schema.validate_batch(items)
-
-            # Parse
             market_snapshot = {}
             btc_p, eth_p = 0, 0
             all_prices = []
@@ -434,7 +381,6 @@ def run():
             for k, v in items:
                 clean_k = str(k).split('-')[0].upper().replace('/', '_')
                 norm = DataParser.normalize(str(k), v)
-                
                 if norm:
                     market_snapshot[clean_k] = norm
                     all_prices.append(norm['price'])
@@ -442,7 +388,6 @@ def run():
                     if 'ETH' in clean_k: eth_p = norm['price']
 
             frozen_count = state.check_soft_freeze_and_gc(market_snapshot)
-            
             if not stats.update_and_validate(btc_p, eth_p, all_prices):
                 time.sleep(5); continue
 
@@ -450,16 +395,11 @@ def run():
             freeze_ratio = frozen_count / total if total > 0 else 0
             
             if total > 50 and freeze_ratio < FREEZE_THRESHOLD_PCT:
-                meta_data = {
-                    'total_coins': total,
-                    'frozen_count': frozen_count,
-                    'ts': datetime.now().isoformat(),
-                    'schema_v': SCHEMA_VERSION
-                }
-                new_hash = fb.push(market_snapshot, meta_data, state.prev_hash)
+                meta = {'total': total, 'frozen': frozen_count, 'ts': datetime.now().isoformat(), 'v': SCHEMA_VERSION}
+                new_hash = fb.push(market_snapshot, meta, state.prev_hash)
                 if new_hash != state.prev_hash: state.prev_hash = new_hash
             else:
-                logger.warning(f"⚠️ Quality Gate: Coins={total}, Freeze={frozen_count}")
+                logger.warning(f"⚠️ Quality Gate: Coins={total}")
 
             elapsed = time.time() - loop_s
             time.sleep(max(0, POLL_INTERVAL - elapsed))
@@ -470,5 +410,4 @@ def run():
 if __name__ == "__main__":
     try: run()
     except KeyboardInterrupt: pass
-    except Exception as e:
-        logger.critical(f"🔥 FATAL: {e}"); sys.exit(1)
+    except Exception as e: logger.critical(f"🔥 FATAL: {e}"); sys.exit(1)
