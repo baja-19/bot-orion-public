@@ -1,543 +1,516 @@
 import os
 import sys
-import json
 import time
-import gc
+import json
 import random
-import re
-import signal
-import traceback
-from datetime import datetime, timezone, timedelta
-
 import requests
+import logging
+import hashlib
+import statistics
+import threading
+from datetime import datetime, timedelta
+from collections import deque
+from typing import List, Dict, Any, Tuple, Optional, Set
 
-# Optional: DrissionPage (browser fallback). Ensure installed in runner if fallback needed.
-try:
-    from DrissionPage import ChromiumPage, ChromiumOptions
-    _HAS_DRISSION = True
-except Exception:
-    _HAS_DRISSION = False
+# ==========================================
+# 1. KONFIGURASI GLOBAL
+# ==========================================
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL")
+INITIAL_COOKIES = os.environ.get("ORION_COOKIES_JSON", "{}") 
 
-# Firebase admin
-try:
-    import firebase_admin
-    from firebase_admin import credentials, db
-    _HAS_FIREBASE_ADMIN = True
-except Exception:
-    _HAS_FIREBASE_ADMIN = False
+# Internal Config
+ORION_API_URL = "https://orionterminal.com/api/screener"
+CYCLE_ACTIVE_SEC = 270   
+CYCLE_PAUSE_SEC = 30     
+POLL_INTERVAL = 3        
+DATA_LIMIT = 1000
+MAX_SNAPSHOTS_TO_KEEP = 48
+SCHEMA_VERSION = "5.4.0"
+ROUNDING_PRECISION = 8  # [FIX 2] Untuk konsistensi Hash
 
-# =========================
-# CONFIG
-# =========================
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/"
+# Memory Limits
+MAX_MEMORY_KEYS = 2000 
+FREEZE_THRESHOLD_PCT = 0.2
+MAX_AUTH_RETRIES = 5    # [FIX 4] Circuit breaker limit
+
+# Setup Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-ORION_API_URL = os.environ.get("ORION_API_URL", "https://orionterminal.com/api/screener")
-ORION_UI_URL = os.environ.get("ORION_UI_URL", "https://orionterminal.com/screener")
+logger = logging.getLogger("Orion-v5.4")
 
-GLOBAL_TIMEOUT = int(os.environ.get("GLOBAL_TIMEOUT", "270"))  # seconds
-FETCH_INTERVAL = int(os.environ.get("FETCH_INTERVAL", "60"))   # seconds
-TIMEOUT_REQUEST = int(os.environ.get("TIMEOUT_REQUEST", "20")) # seconds
+# ==========================================
+# 2. STATE & INTEGRITY ENGINE
+# ==========================================
+class StateTracker:
+    def __init__(self, firebase_url):
+        self.firebase_url = firebase_url.rstrip('/') if firebase_url else ""
+        self.prev_hash = self._load_last_hash()
+        self.price_memory: Dict[str, deque] = {} 
+        self.max_memory = 10
+        self.epsilon = 1e-8 
 
-BROWSER_PAGELOAD_TIMEOUT = int(os.environ.get("BROWSER_PAGELOAD_TIMEOUT", "30"))
-BROWSER_JS_TIMEOUT = int(os.environ.get("BROWSER_JS_TIMEOUT", "8"))
+    def _load_last_hash(self) -> str:
+        if not self.firebase_url: return "0"*64
+        try:
+            url = f"{self.firebase_url}/orion_snapshots.json?orderBy=\"$key\"&limitToLast=1"
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200 and res.json():
+                last_key = list(res.json().keys())[0]
+                last_data = res.json()[last_key]
+                if 'integrity' in last_data and 'chain_hash' in last_data['integrity']:
+                    return last_data['integrity']['chain_hash']
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load last hash: {e}")
+        return "0"*64 
 
-SNAPSHOT_RETENTION_HOURS = int(os.environ.get("SNAPSHOT_RETENTION_HOURS", "24"))
-CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "900"))
+    def check_soft_freeze_and_gc(self, current_snapshot: Dict) -> int:
+        frozen_count = 0
+        current_keys = set(current_snapshot.keys())
+        
+        for symbol, data in current_snapshot.items():
+            price = data['price']
+            if symbol not in self.price_memory:
+                self.price_memory[symbol] = deque(maxlen=self.max_memory)
+            
+            mem = self.price_memory[symbol]
+            mem.append(price)
+            
+            # Soft Freeze Logic
+            if len(mem) == self.max_memory:
+                min_p, max_p = min(mem), max(mem)
+                if (max_p - min_p) < self.epsilon:
+                    frozen_count += 1
+                    # Kita tidak memodifikasi data market agar hash tetap murni
+                    # Info freeze akan masuk ke metadata terpisah
+        
+        # GC
+        existing_keys = set(self.price_memory.keys())
+        stale_keys = existing_keys - current_keys
+        if len(stale_keys) > 100:
+            for k in stale_keys: del self.price_memory[k]
+        
+        if len(self.price_memory) > MAX_MEMORY_KEYS:
+            self.price_memory.clear()
+            
+        return frozen_count
 
-# Column contract (36 keys) — used for index mapping if API returns numeric keys
-COLUMNS_KEYS = [
-    "price", "ticks_5m", "change_5m", "volume_5m", "volatility_15m",
-    "volume_1h", "vdelta_1h", "oi_change_8h", "change_1d", "funding_rate",
-    "open_interest", "oi_mc_ratio", "btc_corr_1d", "eth_corr_1d",
-    "btc_corr_3d", "eth_corr_3d", "btc_beta_1d", "eth_beta_1d",
-    "change_15m", "change_1h", "change_8h", "oi_change_15m",
-    "oi_change_1d", "oi_change_1h", "oi_change_5m", "volatility_1h",
-    "volatility_5m", "ticks_15m", "ticks_1h", "vdelta_15m",
-    "vdelta_1d", "vdelta_5m", "vdelta_8h", "volume_15m",
-    "volume_1d", "volume_8h"
-]
-
-SYMBOL_REGEX = re.compile(r'^[A-Z0-9_]{2,20}$')
-
-SLEEP_CHUNK = 0.4  # adaptive sleep chunk
-
-# =========================
-# LOG + FLUSH
-# =========================
-def lg(msg: str):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
-    sys.stdout.flush()
-
-# =========================
-# GLOBAL TIMER HELPERS
-# =========================
-START_TIME = time.time()
-
-def time_left() -> float:
-    return max(0.0, GLOBAL_TIMEOUT - (time.time() - START_TIME))
-
-def ensure_time(min_left: float = 0.5):
-    if time_left() <= min_left:
-        raise TimeoutError("Global timeout reached")
-
-# =========================
-# FIREBASE INIT (using FIREBASE_KEY_JSON env)
-# =========================
-def init_firebase():
-    key_json = os.environ.get("FIREBASE_KEY_JSON")
-    if not key_json:
-        raise RuntimeError("FIREBASE_KEY_JSON not found in environment (set as GitHub Secret)")
-
-    if not _HAS_FIREBASE_ADMIN:
-        raise RuntimeError("firebase_admin package not installed in runner")
-
-    try:
-        cred_dict = json.loads(key_json)
-    except Exception as e:
-        raise RuntimeError(f"FIREBASE_KEY_JSON parse error: {e}")
-
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(cred_dict)
-        firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
-    lg("Firebase initialized")
-
-# =========================
-# Orion API client (requests)
-# =========================
-class OrionAPI:
+class MarketStats:
     def __init__(self):
-        self.session = requests.Session()
-        self.rotate_headers()
+        self.btc_hist = deque(maxlen=10)
+        self.eth_hist = deque(maxlen=10)
+        self.global_median_hist = deque(maxlen=10)
+        
+    def update_and_validate(self, btc_p: float, eth_p: float, all_prices: List[float]) -> bool:
+        current_median = statistics.median(all_prices) if all_prices else 0
+        
+        if btc_p > 0: self.btc_hist.append(btc_p)
+        if eth_p > 0: self.eth_hist.append(eth_p)
+        if current_median > 0: self.global_median_hist.append(current_median)
+        
+        if len(self.btc_hist) < 3: return True 
+        
+        anomalies = 0
+        if self.btc_hist:
+            btc_med = statistics.median(self.btc_hist)
+            if btc_med > 0 and abs(btc_p - btc_med) / btc_med > 0.2: anomalies += 1
+            
+        if self.eth_hist:
+            eth_med = statistics.median(self.eth_hist)
+            if eth_med > 0 and abs(eth_p - eth_med) / eth_med > 0.2: anomalies += 1
+            
+        if self.global_median_hist:
+            glob_med = statistics.median(self.global_median_hist)
+            if glob_med > 0 and abs(current_median - glob_med) / glob_med > 0.3: anomalies += 1
+            
+        if anomalies >= 2:
+            logger.error(f"📉 MARKET DATA ANOMALY! Flags: {anomalies}/3")
+            return False
+        return True
 
-    def rotate_headers(self):
-        self.session.headers.clear()
+class SchemaGuard:
+    def __init__(self):
+        self.ref_keys: Set[str] = set()
+        self.locked = False
+        self.cycle_count = 0 
+        self.warmup_cycles = 3
+        
+    def validate_batch(self, items: List[Tuple[str, Dict]]) -> bool:
+        if not items: return True
+        
+        if not self.locked:
+            self.cycle_count += 1
+            current_batch_keys = set()
+            for _, data in items:
+                current_batch_keys.update(data.keys())
+            
+            if len(current_batch_keys) > len(self.ref_keys):
+                self.ref_keys = current_batch_keys
+
+            if self.cycle_count >= self.warmup_cycles:
+                self.locked = True
+                logger.info(f"🛡️ Schema Locked. Fields: {len(self.ref_keys)}")
+            return True
+
+        sample_size = min(len(items), 5)
+        samples = random.sample(items, sample_size)
+        valid_votes = 0
+        required = {'ticker', 'last_price'}
+        
+        for _, data in samples:
+            current_keys = set(data.keys())
+            missing = required - current_keys
+            price_val = data.get('last_price') or data.get('price')
+            type_ok = isinstance(price_val, (int, float)) or \
+                      (isinstance(price_val, str) and price_val.replace('.','').isdigit())
+            
+            if not missing and type_ok:
+                valid_votes += 1
+        
+        if valid_votes / sample_size < 0.5:
+            logger.critical(f"🚨 SCHEMA DRIFT! Valid: {valid_votes}/{sample_size}")
+            return False
+        return True
+
+# ==========================================
+# 3. INTELLIGENT PARSER
+# ==========================================
+class DataParser:
+    SCHEMA_MAP = {
+        'price':        ['11', 'last_price', 'close', 'price', 0.0],
+        'volume_24h':   ['10', 'volume_24h', 'volume', 0.0],
+        'change_24h':   ['6', 'change_24h', 'change', 0.0],
+        'rsi':          ['rsi', 'rsi_14', 50.0],
+        'funding':      ['funding_rate', 'funding', 0.0],
+        'oi':           ['open_interest', 'oi', 0.0]
+    }
+
+    @staticmethod
+    def _extract_heuristic(raw_data: Dict, keys: List[Any], field_type: str) -> float:
+        default = keys[-1]
+        for k in keys[:-1]:
+            if k not in raw_data: continue
+            val = raw_data[k]
+            
+            if isinstance(val, list):
+                if not val: return float(default)
+                nums = [v for v in val if isinstance(v, (int, float))]
+                if not nums: return float(default)
+                
+                chosen = nums[0]
+                if field_type == 'volume': chosen = max(nums)
+                elif field_type == 'percent':
+                     candidates = [n for n in nums if -100 <= n <= 100]
+                     chosen = candidates[0] if candidates else nums[0]
+                return float(chosen)
+
+            try:
+                if val is None: continue
+                return float(val)
+            except: continue
+        return float(default)
+
+    @staticmethod
+    def normalize(raw_key: str, raw_data: Dict) -> Optional[Dict]:
+        """
+        [FIX 1] Removed 'fetch_time' parameter.
+        Membersihkan data koin secara murni.
+        """
+        clean = {}
+        
+        for out_key, mapping in DataParser.SCHEMA_MAP.items():
+            ftype = 'volume' if 'volume' in out_key else ('percent' if 'change' in out_key or 'funding' in out_key else 'price')
+            val = DataParser._extract_heuristic(raw_data, mapping, ftype)
+            clean[out_key] = val
+        
+        if clean['price'] <= 0: return None
+        
+        # Market Type Detection
+        raw_lower = raw_key.lower()
+        clean['type'] = 'futures' if ('perp' in raw_lower or 'usdm' in raw_lower or clean['funding'] != 0) else 'spot'
+        
+        return clean
+
+# ==========================================
+# 4. ROBUST NETWORK CLIENT (SCAVENGER)
+# ==========================================
+class RobustOrionClient:
+    def __init__(self, firebase_url):
+        self.session = requests.Session()
+        self.firebase_url = firebase_url
+        self._lock = threading.Lock()
+        self.auth_fail_count = 0 # [FIX 4] Counter
+        
+        self._inject_initial_cookies()
+        self._set_base_headers()
+
+    def _set_base_headers(self):
         self.session.headers.update({
-            "accept": "application/json, text/javascript, */*; q=0.01",
-            "x-requested-with": "XMLHttpRequest",
-            "referer": ORION_UI_URL,
-            "user-agent": random.choice([
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "Mozilla/5.0 (X11; Linux x86_64)",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
-            ])
+            'accept': 'application/json',
+            'referer': 'https://orionterminal.com/screener',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'x-requested-with': 'XMLHttpRequest'
         })
 
-    def set_cookies(self, cookies: dict):
-        if cookies:
-            # update Session cookies (reliable)
+    def _inject_initial_cookies(self):
+        try:
+            cookies = json.loads(INITIAL_COOKIES)
             self.session.cookies.update(cookies)
-            # also set cookie header
-            self.session.headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        except: pass
 
-    def fetch(self):
-        ensure_time(1.0)
+    def _validate_cookies(self, cookies: Dict) -> bool:
+        """[FIX 3] Pre-flight validation untuk cookies baru."""
         try:
-            r = self.session.get(ORION_API_URL, timeout=TIMEOUT_REQUEST)
-        except Exception as e:
-            raise RuntimeError(f"HTTP request failed: {e}")
-
-        lg(f"API status: {r.status_code}")
-        ctype = r.headers.get("content-type", "")
-        # handle empty / not-modified
-        if r.status_code in (204, 304):
-            raise RuntimeError(f"API returned status {r.status_code}")
-
-        # detect HTML (blocked)
-        if "html" in ctype.lower() or r.text.strip().startswith("<"):
-            snippet = r.text[:800].replace("\n", " ")
-            lg(f"API returned HTML/snippet: {snippet!r}")
-            raise RuntimeError("API returned HTML (likely blocked)")
-
-        try:
-            parsed = r.json()
-            if isinstance(parsed, dict):
-                lg(f"API top keys: {list(parsed.keys())[:12]}")
-            return parsed
-        except Exception as e:
-            snippet = r.text[:800].replace("\n", " ")
-            lg(f"JSON parse failed: {e} | snippet: {snippet!r}")
-            raise RuntimeError("Failed to parse JSON from API")
-
-# =========================
-# JSON discovery helpers
-# =========================
-def find_rows_in_json(obj):
-    # direct list-of-dict shape
-    if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-        return obj
-    if isinstance(obj, dict):
-        # common keys first
-        for k in ("data", "rows", "result", "payload", "items", "markets"):
-            v = obj.get(k)
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                return v
-        # BFS shallow
-        q = list(obj.values())
-        for _ in range(3):
-            nq = []
-            for v in q:
-                if isinstance(v, list) and v and isinstance(v[0], dict):
-                    return v
-                if isinstance(v, dict):
-                    nq.extend(v.values())
-            q = nq
-    return None
-
-# sanitize symbol
-def _sanitize_symbol(s):
-    try:
-        s2 = str(s)
-    except:
-        return None
-    s2 = s2.replace("/", "_").replace("-", "_").replace(".", "_").upper()
-    s2 = re.sub(r'[^A-Z0-9_]', '_', s2)
-    return s2
-
-# =========================
-# normalize_data (robust, handles indexed dict-of-symbols)
-# =========================
-def normalize_data(raw):
-    coins = {}
-
-    # 1) list of dicts?
-    rows = find_rows_in_json(raw)
-    if rows:
-        lg("Parsing mode: rows(list-of-dicts)")
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            symbol_raw = row.get("symbol") or row.get("market") or row.get("pair") or row.get("name") or row.get("s")
-            if not symbol_raw:
-                continue
-            symbol = _sanitize_symbol(symbol_raw)
-            if not symbol or not SYMBOL_REGEX.match(symbol):
-                continue
-            record = {"symbol": symbol, "updated_utc": datetime.utcnow().isoformat()}
-            # include mandatory contract keys if available
-            for k in COLUMNS_KEYS:
-                record[k] = row.get(k, None)
-            # include any other fields
-            for k, v in row.items():
-                if k not in record:
-                    record[k] = v
-            coins[symbol] = record
-        return coins
-
-    # 2) dict-of-symbols with numeric-indexed inner dicts?
-    if isinstance(raw, dict):
-        # quick heuristic: count how many child values are dicts and how many have numeric keys
-        total = 0
-        dict_children = 0
-        numeric_inner = 0
-        for k, v in raw.items():
-            total += 1
-            if isinstance(v, dict):
-                dict_children += 1
-                inner_nums = sum(1 for ik in v.keys() if re.fullmatch(r'\d+', str(ik)))
-                if inner_nums > 0:
-                    numeric_inner += 1
-        if dict_children > 0 and numeric_inner >= max(1, dict_children // 4):
-            lg("Parsing mode: dict-of-symbols with numeric indices detected")
-            for sym_key, inner in raw.items():
-                if not isinstance(inner, dict):
-                    continue
-                symbol = _sanitize_symbol(sym_key)
-                if not symbol or not SYMBOL_REGEX.match(symbol):
-                    continue
-                record = {"symbol": symbol, "updated_utc": datetime.utcnow().isoformat()}
-                for inner_k, val in inner.items():
-                    sk = str(inner_k)
-                    if re.fullmatch(r'\d+', sk):
-                        idx = int(sk)
-                        # If Orion indexes start at 1 instead of 0, we cannot be certain.
-                        # Heuristic: if idx==0 used, keep as 0; if majority >=1, we leave as-is.
-                        if 0 <= idx < len(COLUMNS_KEYS):
-                            mapped = COLUMNS_KEYS[idx]
-                        else:
-                            mapped = f"col_{idx}"
-                        record[mapped] = val
-                    else:
-                        # non-numeric keys stored as-is
-                        record[sk] = val
-                # ensure required columns exist
-                for ck in COLUMNS_KEYS:
-                    if ck not in record:
-                        record[ck] = None
-                coins[symbol] = record
-            return coins
-
-    # fallback: unknown format
-    try:
-        if isinstance(raw, dict):
-            lg("⚠️ normalize_data: unknown JSON shape. Top-level keys sample:")
-            lg(str(list(raw.keys())[:40]))
-    except Exception:
-        pass
-    return coins
-
-# =========================
-# Browser fallback (only if DrissionPage available)
-# =========================
-def browser_fallback(start_time):
-    if not _HAS_DRISSION:
-        raise RuntimeError("DrissionPage not installed; cannot browser-fallback")
-
-    ensure_time(8.0)
-    lg("Starting browser fallback (DrissionPage) to harvest cookies & force render")
-
-    co = ChromiumOptions()
-    co.set_argument("--headless=new")
-    co.set_argument("--no-sandbox")
-    co.set_argument("--disable-gpu")
-    co.set_argument("--window-size=5000,3000")
-    co.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-
-    page = ChromiumPage(addr_or_opts=co)
-    # set page load timeout
-    try:
-        page.set.timeouts(page_load=BROWSER_PAGELOAD_TIMEOUT)
-    except Exception:
-        pass
-
-    try:
-        # page.get with hard timeout via alarm if on unix main thread
-        try:
-            ensure_time(5.0)
-            page.get(ORION_UI_URL)
-        except Exception as e:
-            lg(f"⚠️ page.get warning: {e}")
-
-        # small adaptive wait
-        t0 = time.time()
-        while time.time() - t0 < 4:
-            if time_left() <= 2:
-                break
-            time.sleep(0.4)
-
-        # Try click Columns panel via JS (best-effort)
-        js_click_columns = """
-        (function(){
-            try{
-                let btn = document.querySelector('button[aria-label="Columns"], button[title*="Columns"], .columns-btn, .btn-columns');
-                if(btn) btn.click();
-                const panels = document.querySelectorAll('div, section');
-                panels.forEach(p=>{
-                    const inputs = p.querySelectorAll('input[type=checkbox]');
-                    inputs.forEach(i=>{ if(!i.checked) i.click(); });
-                });
-                return true;
-            }catch(e){ return false; }
-        })();
-        """
-        try:
-            page.run_js(js_click_columns, timeout=BROWSER_JS_TIMEOUT)
-        except Exception:
-            pass
-
-        # Snake scrolling
-        for _ in range(2):
-            if time_left() <= 3:
-                break
-            try:
-                page.run_js("window.scrollTo(0, document.body.scrollHeight);", timeout=BROWSER_JS_TIMEOUT)
-            except:
-                pass
-            time.sleep(0.6)
-            try:
-                page.run_js("window.scrollTo(document.body.scrollWidth, 0);", timeout=BROWSER_JS_TIMEOUT)
-            except:
-                pass
-            time.sleep(0.6)
-            try:
-                page.run_js("window.scrollTo(0, 0);", timeout=BROWSER_JS_TIMEOUT)
-            except:
-                pass
-            time.sleep(0.6)
-
-        # collect cookies
-        cookies = {}
-        try:
-            for c in page.cookies:
-                cookies[c['name']] = c['value']
-        except Exception:
-            try:
-                # fallback: page.cookies() call
-                for c in page.cookies():
-                    cookies[c.get('name')] = c.get('value')
-            except:
-                pass
-
-        lg(f"Cookies harvested: {list(cookies.keys())[:6]}")
-        return cookies
-    finally:
-        try:
-            page.quit()
+            # Menggunakan endpoint limit 1 yang ringan
+            test_url = f"{ORION_API_URL}?limit=1"
+            res = requests.get(test_url, cookies=cookies, headers=self.session.headers, timeout=5)
+            return res.status_code == 200
         except:
-            pass
+            return False
 
-# =========================
-# fetch_and_push (retry/backoff, fallback)
-# =========================
-def fetch_and_push(api, root_ref, start_time):
-    max_attempts = 4
-    attempt = 0
-    backoff_base = 1.6
-    raw = None
-    while attempt < max_attempts:
-        attempt += 1
-        ensure_time(1.0)
+    def _scavenge_cookies(self) -> bool:
+        logger.info("♻️ Scavenging cookies...")
         try:
-            lg(f"Attempt {attempt} fetch API")
-            raw = api.fetch()
-            coins = normalize_data(raw)
-            if coins:
-                ts = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
-                # push to firebase
-                root_ref.child("coins").update(coins)
-                root_ref.child("metadata").update({
-                    "last_update": ts,
-                    "total_coins": len(coins),
-                    "source": "orion_xhr_api"
-                })
-                root_ref.child("snapshots").child(ts).set(coins)
-                lg(f"✅ {len(coins)} coins pushed @ {ts}")
+            url = f"{self.firebase_url}/config/orion_cookies.json"
+            res = requests.get(url, timeout=10)
+            
+            if res.status_code == 200 and res.json():
+                new_cookies = res.json()
+                
+                # Validasi dulu sebelum swap
+                if not self._validate_cookies(new_cookies):
+                    logger.warning("⚠️ Scavenged cookies are INVALID.")
+                    return False
+
+                with self._lock:
+                    self.session.cookies.clear()
+                    self.session.cookies.update(new_cookies)
+                    self.auth_fail_count = 0 # Reset counter
+                    logger.info("✅ Cookies Hot-Reloaded & Verified.")
                 return True
-            else:
-                lg(f"⚠️ No coins parsed on attempt {attempt}")
-                if attempt == 1:
-                    if time_left() > 8 and _HAS_DRISSION:
-                        try:
-                            cookies = browser_fallback(start_time)
-                            api.rotate_headers()
-                            api.set_cookies(cookies)
-                            lg("🔁 retry after cookie harvest")
-                        except Exception as e_fb:
-                            lg(f"⚠️ Browser fallback failed: {e_fb}")
-                # backoff sleep (adaptive)
-                sleep_for = min(8, (backoff_base ** attempt))
-                lg(f"⏳ backoff sleeping {sleep_for}s")
-                t_end = time.time() + sleep_for
-                while time.time() < t_end:
-                    ensure_time(0.8)
-                    time.sleep(SLEEP_CHUNK)
-                continue
         except Exception as e:
-            lg(f"⚠️ Fetch attempt {attempt} raised: {e}")
-            if attempt == 1 and time_left() > 8 and _HAS_DRISSION:
-                try:
-                    cookies = browser_fallback(start_time)
-                    api.rotate_headers()
-                    api.set_cookies(cookies)
-                except Exception as e_fb:
-                    lg(f"Fallback failed: {e_fb}")
-            sleep_for = min(8, (backoff_base ** attempt))
-            lg(f"⏳ after-exception sleeping {sleep_for}s")
-            t_end = time.time() + sleep_for
-            while time.time() < t_end:
-                ensure_time(0.8)
-                time.sleep(SLEEP_CHUNK)
-            continue
+            logger.error(f"❌ Scavenge fail: {e}")
+        return False
 
-    # after attempts exhausted
-    try:
-        lg("❌ All attempts failed. Raw snippet (first 1500 chars):")
-        if raw is not None:
+    def fetch(self) -> Tuple[Any, str]:
+        params = {"limit": DATA_LIMIT, "sort": "volume", "order": "desc"}
+        backoff = 2
+        
+        # [FIX 4] Hard Stop jika gagal terus menerus
+        if self.auth_fail_count > MAX_AUTH_RETRIES:
+            logger.critical("🛑 TOO MANY AUTH FAILURES. Sleeping 5 mins...")
+            time.sleep(300)
+            self.auth_fail_count = 0 # Reset percobaan
+
+        for _ in range(3):
             try:
-                lg(json.dumps(raw)[:1500])
-            except Exception:
-                lg(str(raw)[:1500])
-    except Exception:
-        pass
-    return False
+                with self._lock:
+                    res = self.session.get(ORION_API_URL, params=params, timeout=20)
+                
+                if res.status_code == 429:
+                    time.sleep(int(res.headers.get("Retry-After", 30)))
+                    continue
 
-# =========================
-# cleanup old snapshots (timestamp keys)
-# =========================
-def cleanup_old_snapshots(root_ref):
-    try:
-        snap_ref = root_ref.child("snapshots")
-        snaps = snap_ref.get()
-        if not snaps:
-            return 0
-        now = datetime.utcnow()
-        deleted = 0
-        for key in list(snaps.keys()):
+                if res.status_code in [403, 401]:
+                    self.auth_fail_count += 1
+                    logger.warning(f"⛔ Auth Failed. Retry ({self.auth_fail_count}/{MAX_AUTH_RETRIES})")
+                    
+                    if self._scavenge_cookies():
+                        time.sleep(2); continue
+                    
+                    return {}, "AUTH_DEAD"
+                
+                if res.status_code == 200:
+                    self.auth_fail_count = 0 # Success reset
+                    return res.json(), "OK"
+                
+                if res.status_code >= 500:
+                    time.sleep(backoff); backoff *= 2; continue
+
+            except Exception as e:
+                logger.error(f"⚠️ Network: {e}")
+                time.sleep(backoff)
+        
+        return {}, "FAIL"
+
+# ==========================================
+# 5. FIREBASE CLIENT (DETERMINISTIC)
+# ==========================================
+class SecureFirebaseClient:
+    def __init__(self, db_url):
+        self.db_url = db_url.rstrip('/') if db_url else ""
+
+    def _recursive_round(self, obj):
+        """[FIX 2] Helper untuk rounding rekursif agar hash stabil."""
+        if isinstance(obj, float):
+            return round(obj, ROUNDING_PRECISION)
+        if isinstance(obj, dict):
+            return {k: self._recursive_round(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._recursive_round(x) for x in obj]
+        return obj
+
+    def _compute_canonical_hash(self, market_data: Dict) -> str:
+        """
+        Canonical Hash: Sorted Keys + Rounded Floats.
+        """
+        # 1. Round semua float
+        rounded_data = self._recursive_round(market_data)
+        # 2. Dump dengan sort_keys=True
+        canonical_str = json.dumps(rounded_data, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(canonical_str.encode()).hexdigest()
+
+    def push(self, market_data: Dict, meta_data: Dict, prev_hash: str) -> str:
+        if not self.db_url: return ""
+        
+        # Compute Deterministic Hash
+        data_hash = self._compute_canonical_hash(market_data)
+        chain_hash = hashlib.sha256(f"{prev_hash}{data_hash}".encode()).hexdigest()
+        
+        container = {
+            "market": market_data,
+            "meta": meta_data,
+            "integrity": {
+                "hash": data_hash,
+                "chain_hash": chain_hash,
+                "prev_hash": prev_hash,
+                "ts_iso": datetime.now().isoformat()
+            }
+        }
+
+        ts_key = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        url = f"{self.db_url}/orion_snapshots/{ts_key}.json"
+        
+        # [FIX 5] Simple Retry Logic
+        for attempt in range(2):
             try:
-                ts = datetime.strptime(key, "%Y-%m-%d_%H-%M-%S")
-                age_hours = (now - ts).total_seconds() / 3600.0
-                if age_hours > SNAPSHOT_RETENTION_HOURS:
-                    snap_ref.child(key).delete()
-                    deleted += 1
-            except Exception:
-                continue
-        if deleted:
-            lg(f"🧹 Cleanup: {deleted} snapshots removed")
-        return deleted
-    except Exception as e:
-        lg(f"⚠️ cleanup_old_snapshots error: {e}")
-        return 0
+                res = requests.put(url, json=container, timeout=10)
+                if res.status_code == 200:
+                    logger.info(f"✅ Pushed: {ts_key} | Chain: {chain_hash[:8]}")
+                    self.cleanup()
+                    return chain_hash
+                else:
+                    logger.warning(f"Push Fail (Attempt {attempt+1}): {res.status_code}")
+                    time.sleep(1)
+            except Exception as e:
+                logger.error(f"Push Error: {e}")
+                
+        return prev_hash
 
-# =========================
-# MAIN
-# =========================
+    def cleanup(self):
+        try:
+            url = f"{self.db_url}/orion_snapshots.json?shallow=true"
+            res = requests.get(url, timeout=5)
+            if res.status_code != 200: return
+            
+            keys = sorted(list(res.json().keys()))
+            if len(keys) <= MAX_SNAPSHOTS_TO_KEEP: return
+            
+            # Delete old by age approximation (sorted strings work for ISO dates)
+            to_delete = keys[:-MAX_SNAPSHOTS_TO_KEEP]
+            for k in to_delete[:5]:
+                requests.delete(f"{self.db_url}/orion_snapshots/{k}.json")
+        except: pass
+
+# ==========================================
+# 6. MAIN ORCHESTRATOR
+# ==========================================
 def run():
-    lg("🚀 ORION QUANT BOT START")
-    try:
-        init_firebase()
-    except Exception as e:
-        lg(f"❌ Firebase init failed: {e}")
-        lg(traceback.format_exc())
+    if not FIREBASE_DB_URL:
+        logger.critical("🔥 MISSING ENV: FIREBASE_DB_URL")
         return
 
-    if not _HAS_DRISSION:
-        lg("⚠️ DrissionPage not installed — browser fallback disabled (may still work if API is stable)")
-
-    api = OrionAPI()
-    root_ref = db.reference('screener_orion')
-
-    start_time = time.time()
-    last_cleanup = 0
+    client = RobustOrionClient(FIREBASE_DB_URL)
+    fb = SecureFirebaseClient(FIREBASE_DB_URL)
+    schema = SchemaGuard()
+    stats = MarketStats()
+    state = StateTracker(FIREBASE_DB_URL)
+    
+    logger.info(f"🚀 HARVESTER v5.4 STARTED | Chain: {state.prev_hash[:8]}")
 
     while True:
-        if time.time() - start_time > GLOBAL_TIMEOUT:
-            lg("⏹️ Timeout global tercapai, exit")
-            break
+        cycle_start = time.time()
+        logger.info("🟢 CYCLE ACTIVE")
 
-        try:
-            ok = fetch_and_push(api, root_ref, start_time)
-            if ok:
-                # cleanup occasionally
-                if time.time() - last_cleanup > CLEANUP_INTERVAL:
-                    cleanup_old_snapshots(root_ref)
-                    last_cleanup = time.time()
-        except TimeoutError:
-            lg("⏰ Global timeout encountered — exiting")
-            break
-        except Exception as e:
-            lg(f"❌ Error cycle: {e}")
-            lg(traceback.format_exc())
+        while (time.time() - cycle_start) < CYCLE_ACTIVE_SEC:
+            loop_s = time.time()
+            
+            # 1. FETCH
+            raw, status = client.fetch()
+            if status == "AUTH_DEAD":
+                logger.critical("💀 AUTH DEAD. Waiting...")
+                time.sleep(15); continue
+            if not raw:
+                time.sleep(POLL_INTERVAL); continue
 
-        # adaptive sleep broken into chunks so we can exit quickly if time's up
-        t_end = time.time() + FETCH_INTERVAL
-        while time.time() < t_end:
-            if time.time() - start_time > GLOBAL_TIMEOUT:
-                break
-            time.sleep(SLEEP_CHUNK)
+            # 2. STANDARDIZE
+            items = []
+            if isinstance(raw, dict):
+                if 'data' in raw and isinstance(raw['data'], list):
+                    items = [(x.get('ticker', 'UNK'), x) for x in raw['data']]
+                else: items = raw.items()
+            elif isinstance(raw, list):
+                items = [(x.get('ticker', 'UNK'), x) for x in raw]
 
-    lg("🏁 ORION QUANT BOT FINISHED (graceful)")
+            # 3. SCHEMA GUARD
+            if items and not schema.validate_batch(items):
+                logger.warning("⚠️ Schema Drift Detected!")
+
+            # 4. PARSE & NORMALIZE
+            market_snapshot = {}
+            fetch_time = datetime.now().isoformat()
+            btc_p, eth_p = 0, 0
+            all_prices = []
+
+            for k, v in items:
+                clean_k = str(k).split('-')[0].upper().replace('/', '_')
+                
+                # [FIX 1] Removed extra arg
+                norm = DataParser.normalize(str(k), v)
+                
+                if norm:
+                    market_snapshot[clean_k] = norm
+                    all_prices.append(norm['price'])
+                    if 'BTC' in clean_k: btc_p = norm['price']
+                    if 'ETH' in clean_k: eth_p = norm['price']
+
+            # 5. SOFT FREEZE & STATS
+            frozen_count = state.check_soft_freeze_and_gc(market_snapshot)
+            
+            if not stats.update_and_validate(btc_p, eth_p, all_prices):
+                logger.error("⛔ STATS ANOMALY. Snapshot Rejected.")
+                time.sleep(5); continue
+
+            # 6. PUSH
+            total = len(market_snapshot)
+            freeze_ratio = frozen_count / total if total > 0 else 0
+            
+            if total > 50 and freeze_ratio < FREEZE_THRESHOLD_PCT:
+                meta_data = {
+                    'total_coins': total,
+                    'frozen_count': frozen_count,
+                    'timestamp': fetch_time,
+                    'schema_v': SCHEMA_VERSION
+                }
+                
+                new_hash = fb.push(market_snapshot, meta_data, state.prev_hash)
+                if new_hash != state.prev_hash:
+                    state.prev_hash = new_hash
+            else:
+                logger.warning(f"⚠️ Quality Gate: Coins={total}, Freeze={frozen_count}")
+
+            elapsed = time.time() - loop_s
+            time.sleep(max(0, POLL_INTERVAL - elapsed))
+
+        logger.info(f"⏸️ COOLDOWN ({CYCLE_PAUSE_SEC}s)...")
+        time.sleep(CYCLE_PAUSE_SEC)
 
 if __name__ == "__main__":
     try:
         run()
+    except KeyboardInterrupt: pass
     except Exception as e:
-        lg(f"FATAL: {e}")
-        lg(traceback.format_exc())
-    finally:
-        try:
-            sys.stdout.flush()
-        except:
-            pass
-        sys.exit(0)
+        logger.critical(f"🔥 FATAL: {e}")
+        sys.exit(1)
