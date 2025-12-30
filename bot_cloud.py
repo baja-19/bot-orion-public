@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import gc
+import re
 from datetime import datetime
 from DrissionPage import ChromiumPage, ChromiumOptions
 import firebase_admin
@@ -13,9 +14,9 @@ from firebase_admin import credentials, db
 # ==============================================================================
 DATABASE_URL = "https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/"
 URL_TARGET = "https://orionterminal.com/screener"
-TIMEOUT_LIMIT = 280 # 4.5 Menit
+TIMEOUT_LIMIT = 285 # 4.7 Menit
 
-# 36 VARIABEL TARGET
+# DAFTAR 36 VARIABEL LENGKAP SESUAI URUTAN TABEL
 COLUMNS_KEYS = [
     "price", "ticks_5m", "change_5m", "volume_5m", "volatility_15m",
     "volume_1h", "vdelta_1h", "oi_change_8h", "change_1d", "funding_rate",
@@ -26,122 +27,119 @@ COLUMNS_KEYS = [
     "vdelta_1d", "vdelta_5m", "vdelta_8h", "volume_15m", "volume_1d", "volume_8h"
 ]
 
-# Daftar kata yang harus diabaikan (Bukan koin)
-BLACKLIST = [
-    "SCREENER", "ALERTS", "CHARTS", "CLI", "SYMBOL", "PRICE", "TICKS", "CHANGE", 
-    "VOLUME", "VOLATILITY", "VDELTA", "OI", "FUNDING", "OPENINTEREST", "MARKETCAP",
-    "ORION", "TERMINAL", "LOGIN", "SIGNUP", "SETTINGS", "PORTFOLIO", "CONNECT"
-]
-
 def init_firebase():
+    """Inisialisasi Firebase menggunakan Secret GitHub"""
     json_str = os.environ.get("FIREBASE_KEY_JSON")
-    if not json_str: return False
+    if not json_str: 
+        print("❌ Kunci FIREBASE_KEY_JSON tidak ditemukan di Secrets!")
+        return False
     try:
         cred_dict = json.loads(json_str)
         if not firebase_admin._apps:
             cred = credentials.Certificate(cred_dict)
             firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
         return True
-    except: return False
+    except Exception as e:
+        print(f"❌ Gagal Init Firebase: {e}")
+        return False
 
-def is_numeric_line(text):
-    """Mengecek apakah baris ini berisi data angka (ciri data koin)"""
-    clean = text.replace('$', '').replace(',', '').replace('%', '').replace('+', '').replace('-', '').replace('.', '').strip()
-    if not clean: return False
-    # Jika baris mengandung banyak angka, berarti ini baris data
-    return sum(c.isdigit() for c in clean) > 3
+def is_clean_symbol(text):
+    """Filter untuk membuang koin dengan karakter aneh (Mandarin/Sampah)"""
+    if not text: return False
+    # Hanya izinkan huruf Latin, Angka, dan simbol trading standar
+    return bool(re.match(r'^[A-Z0-9/_$-]+$', text))
 
-def run_ghost_bypass():
-    print("🔥 INITIALIZING ORION GHOST BYPASS v2.1 (ADAPTIVE PARSING)...")
-    start_global = time.time()
-    
-    if not init_firebase():
-        print("❌ FIREBASE_KEY_JSON NOT FOUND!")
-        return
+def run_super_scraper():
+    print("🔥 INITIALIZING ORION SUPER SCRAPER v4.0 (36 VARS + HORIZONTAL SCROLL)...")
+    if not init_firebase(): return
 
     co = ChromiumOptions()
     co.set_argument('--headless=new')
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-gpu')
     co.set_argument('--disable-dev-shm-usage')
-    co.set_argument('--window-size=3840,2160')
+    # Set resolusi Ultra Wide agar kolom tidak tertutup
+    co.set_argument('--window-size=5120,2880') 
     co.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
 
     try:
         page = ChromiumPage(addr_or_opts=co)
         page.set.timeouts(page_load=60)
         
-        print(f"🌐 ATTACKING TARGET: {URL_TARGET}")
+        print(f"🌐 Membuka Target: {URL_TARGET}")
         page.get(URL_TARGET)
-        time.sleep(25)
-        
-        # Deteksi Cloudflare
-        title = page.title
-        if "Just a moment" in title or "Security" in title:
-            print("🚨 CLOUDFLARE DETECTED! Refreshing...")
-            page.refresh()
-            time.sleep(20)
+        time.sleep(30) # Tunggu rendering awal yang berat
 
+        # Trik Zoom out agar elemen dimuat lebih banyak dalam satu tampilan
         page.run_js("document.body.style.zoom = '10%'")
         
         ref = db.reference('screener_full_data')
         status_ref = db.reference('bot_status')
+        start_time = time.time()
 
-        print("👀 STARTING ADAPTIVE EXTRACTION...")
-
-        while True:
-            if (time.time() - start_global) > TIMEOUT_LIMIT:
-                print("🏁 SESSION TIMEOUT - EXITING")
-                break
-
+        while (time.time() - start_time) < TIMEOUT_LIMIT:
             try:
-                page.run_js("window.scrollTo(0, 5000);")
-                time.sleep(1)
-                page.run_js("window.scrollTo(0, 0);")
-                time.sleep(1)
+                # --- MANUVER SUPER SCROLL (4 ARAH) ---
+                print("🔄 Melakukan Manuver Scroll untuk memancing 36 variabel...")
+                page.scroll.to_bottom(); time.sleep(1)
+                # Geser Kanan Mentok (JavaScript)
+                page.run_js("window.scrollTo(10000, document.body.scrollHeight);"); time.sleep(1)
+                page.scroll.to_top(); time.sleep(1)
+                # Geser balik ke Kiri
+                page.run_js("window.scrollTo(0, 0);"); time.sleep(1)
+
+                # JAVASCRIPT INJECTION: Ekstraksi sel-demi-sel untuk presisi tinggi
+                extraction_script = """
+                let results = [];
+                let rows = Array.from(document.querySelectorAll('div[role="row"], .table-row, .rt-tr-group'));
                 
-                raw_extracted = page.run_js("return document.body.innerText")
-                lines = [l.strip() for l in raw_extracted.split('\n') if l.strip()]
+                rows.forEach(row => {
+                    // Cari semua elemen yang mengandung teks di dalam baris
+                    let cells = Array.from(row.querySelectorAll('div, span, p')).map(c => {
+                        return c.childNodes.length === 1 ? c.innerText.trim() : "";
+                    }).filter(v => v !== "");
+                    
+                    // Filter unik berurutan untuk menghindari data ganda dalam satu baris
+                    let uniqueCells = cells.filter((v, i, a) => a.indexOf(v) === i);
+                    if(uniqueCells.length > 3) {
+                        results.push(uniqueCells);
+                    }
+                });
+                return results;
+                """
+                
+                raw_extracted_data = page.run_js(extraction_script)
                 
                 data_batch = {}
                 count = 0
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                # LOGIKA PARSING BARU: Mendeteksi koin yang simbol dan datanya terpisah baris
-                i = 0
-                while i < len(lines):
-                    line = lines[i]
+                for entry in raw_extracted_data:
+                    if len(entry) < 2: continue
                     
-                    # 1. Deteksi Simbol (Harus mengandung huruf besar, minimal 2 karakter, tidak di blacklist)
-                    if (len(line) >= 2 and any(c.isalpha() for c in line) and 
-                        line.isupper() and line not in BLACKLIST):
+                    symbol = entry[0].upper().strip()
+                    
+                    # Filter Keamanan Nama Koin
+                    if (is_clean_symbol(symbol) and len(symbol) >= 2 and 
+                        symbol not in ["HOME", "PRICE", "ALERTS", "CLI", "SCREENER", "VOL"]):
                         
-                        # 2. Lihat baris berikutnya, apakah berisi kumpulan angka?
-                        if i + 1 < len(lines):
-                            next_line = lines[i+1]
+                        # Pastikan baris data koin valid (ada angka harganya)
+                        if any(c.isdigit() for c in entry[1]):
+                            coin_data = {'updated': ts}
                             
-                            if is_numeric_line(next_line):
-                                # INI ADALAH BARIS DATA KOIN VALID
-                                symbol = line
-                                # Pecah baris data menjadi list berdasarkan spasi/tab
-                                values = next_line.split()
-                                
-                                coin_data = {'updated': ts}
-                                
-                                # Masukkan ke 36 variabel
-                                for idx, key in enumerate(COLUMNS_KEYS):
-                                    if idx < len(values):
-                                        coin_data[key] = values[idx].strip()
-                                    else:
-                                        coin_data[key] = "-"
-                                
-                                # Bersihkan Simbol untuk Firebase path
-                                sym_clean = symbol.replace('.', '_').replace('/', '_').replace('$', '')
-                                data_batch[sym_clean] = coin_data
-                                count += 1
-                                i += 1 # Loncat karena baris i+1 sudah diproses
-                        
-                    i += 1
+                            # Mapping 36 Variabel secara Dinamis
+                            data_idx = 1 # Lewati simbol (index 0)
+                            for key in COLUMNS_KEYS:
+                                if data_idx < len(entry):
+                                    coin_data[key] = entry[data_idx]
+                                    data_idx += 1
+                                else:
+                                    coin_data[key] = "-"
+                            
+                            # Bersihkan ID simbol agar tidak error di Firebase
+                            safe_sym = symbol.replace('.', '_').replace('/', '_').replace('$', '')
+                            data_batch[safe_sym] = coin_data
+                            count += 1
 
                 if data_batch:
                     ref.update(data_batch)
@@ -149,27 +147,28 @@ def run_ghost_bypass():
                         'status': 'ONLINE',
                         'last_active': ts,
                         'coins_found': count,
-                        'environment': 'GITHUB_ACTION'
+                        'vars_captured': len(COLUMNS_KEYS),
+                        'environment': 'GitHub Actions 4K'
                     })
-                    print(f"✅ [{ts}] SUCCESS: Extracted {count} coins.")
+                    print(f"✅ [{ts}] BERHASIL: Mengambil {count} koin dengan {len(COLUMNS_KEYS)} variabel.")
                     sys.stdout.flush()
                 else:
-                    print(f"⚠️ [{ts}] ZERO ROWS: Format data berubah atau halaman belum muat.")
-                    if len(lines) > 10:
-                        print(f"📄 PREVIEW 5 BARIS PERTAMA: {lines[:5]}")
+                    print("⚠️ Data belum terdeteksi. Mencoba memicu ulang...")
+                    page.refresh()
+                    time.sleep(15)
 
                 gc.collect()
-                time.sleep(15)
+                time.sleep(20) # Jeda antar siklus agar tidak dianggap DDOS
 
             except Exception as e:
-                print(f"❌ LOOP ERROR: {e}")
-                time.sleep(5)
-        
+                print(f"⚠️ Kesalahan Loop: {e}")
+                time.sleep(10)
+
         page.quit()
 
     except Exception as e:
-        print(f"❌ FATAL ERROR: {e}")
+        print(f"❌ Error Fatal: {e}")
 
 if __name__ == "__main__":
-    run_ghost_bypass()
+    run_super_scraper()
     sys.exit(0)
