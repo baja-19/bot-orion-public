@@ -2,215 +2,174 @@ import os
 import sys
 import json
 import time
-import gc
-import re
+import random
 from datetime import datetime
-from DrissionPage import ChromiumPage, ChromiumOptions
+import requests
 import firebase_admin
 from firebase_admin import credentials, db
 
 # ==============================================================================
-# KONFIGURASI TITAN
+# CONFIG
 # ==============================================================================
 DATABASE_URL = "https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/"
-URL_TARGET = "https://orionterminal.com/screener"
-TIMEOUT_LIMIT = 285 
+ORION_API_URL = "https://orionterminal.com/api/screener"
 
-# DAFTAR 36 VARIABEL LENGKAP
-COLUMNS_KEYS = [
-    "price", "ticks_5m", "change_5m", "volume_5m", "volatility_15m",
-    "volume_1h", "vdelta_1h", "oi_change_8h", "change_1d", "funding_rate",
-    "open_interest", "oi_mc_ratio", "btc_corr_1d", "eth_corr_1d", "btc_corr_3d",
-    "eth_corr_3d", "btc_beta_1d", "eth_beta_1d", "change_15m", "change_1h",
-    "change_8h", "oi_change_15m", "oi_change_1d", "oi_change_1h", "oi_change_5m",
-    "volatility_1h", "volatility_5m", "ticks_15m", "ticks_1h", "vdelta_15m",
-    "vdelta_1d", "vdelta_5m", "vdelta_8h", "volume_15m", "volume_1d", "volume_8h"
-]
+FETCH_INTERVAL = 60                 # reload data tiap 1 menit
+TIMEOUT = 20
 
-BLACKLIST = ["ALERTS", "CHARTS", "CLI", "SCREENER", "PORTFOLIO", "SETTINGS", "LOGIN", "SIGNUP", "CONNECT", "WALLET", "SEARCH", "FILTER", "COLUMNS", "MARKET"]
+SNAPSHOT_RETENTION_HOURS = 24       # simpan snapshot 24 jam
+CLEANUP_INTERVAL = 900              # cleanup tiap 15 menit
 
+# ==============================================================================
+# FIREBASE INIT
+# ==============================================================================
 def init_firebase():
-    json_str = os.environ.get("FIREBASE_KEY_JSON")
-    if not json_str: return False
-    try:
-        cred_dict = json.loads(json_str)
-        if not firebase_admin._apps:
-            cred = credentials.Certificate(cred_dict)
-            firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
-        return True
-    except: return False
+    key_json = os.environ.get("FIREBASE_KEY_JSON")
+    if not key_json:
+        raise RuntimeError("FIREBASE_KEY_JSON env not found")
 
-def is_clean_symbol(text):
-    if not text or len(text) < 2: return False
-    return bool(re.match(r'^[A-Z0-9/_$-]+$', text))
+    cred_dict = json.loads(key_json)
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(
+            cred,
+            {"databaseURL": DATABASE_URL}
+        )
 
-def force_activate_columns(page):
-    """Fungsi paling penting: Memaksa Orion mencentang semua 36 variabel"""
-    print("🛠️ Memaksa aktivasi semua kolom variabel (36 metrik)...")
-    js_logic = """
-    try {
-        // 1. Temukan dan klik tombol 'Columns'
-        let btns = Array.from(document.querySelectorAll('button'));
-        let target = btns.find(b => b.innerText.includes('Columns') || b.innerHTML.includes('layout'));
-        if(target) {
-            target.click();
-            // 2. Tunggu sebentar dan centang SEMUA checkbox yang mati
-            setTimeout(() => {
-                let checkBoxes = document.querySelectorAll('input[type="checkbox"]');
-                checkBoxes.forEach(cb => {
-                    if(!cb.checked) cb.click();
-                });
-                console.log('Semua kolom diaktifkan.');
-            }, 2000);
+# ==============================================================================
+# ORION API CLIENT (PURE XHR)
+# ==============================================================================
+class OrionAPI:
+    def __init__(self):
+        self.session = requests.Session()
+        self.rotate_headers()
+
+    def rotate_headers(self):
+        self.session.headers.clear()
+        self.session.headers.update({
+            "accept": "application/json, text/javascript, */*; q=0.01",
+            "x-requested-with": "XMLHttpRequest",
+            "referer": "https://orionterminal.com/screener",
+            "user-agent": random.choice([
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Mozilla/5.0 (X11; Linux x86_64)",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+            ])
+        })
+
+    def fetch(self):
+        r = self.session.get(ORION_API_URL, timeout=TIMEOUT)
+        if r.status_code == 200 and r.text:
+            return r.json()
+        raise RuntimeError(f"XHR failed {r.status_code}")
+
+# ==============================================================================
+# NORMALIZE DATA (ALL VARIABLES, NO FILTER)
+# ==============================================================================
+def normalize_data(raw):
+    rows = raw.get("data") or raw.get("rows") or raw
+    coins = {}
+
+    if not isinstance(rows, list):
+        return coins
+
+    for row in rows:
+        symbol = row.get("symbol") or row.get("market")
+        if not symbol:
+            continue
+
+        key = (
+            symbol.replace("/", "_")
+                  .replace("-", "_")
+                  .replace(".", "_")
+                  .upper()
+        )
+
+        coins[key] = {
+            "symbol": key,
+            "updated_utc": datetime.utcnow().isoformat(),
+            **row
         }
-    } catch(e) { console.error(e); }
-    """
-    page.run_js(js_logic)
-    time.sleep(5)
 
-def run_titan_scraper():
-    print("🔥 INITIALIZING ORION TITAN v7.0 (MAX PRECISION)...")
-    if not init_firebase(): return
+    return coins
 
-    co = ChromiumOptions()
-    co.set_argument('--headless=new')
-    co.set_argument('--no-sandbox')
-    co.set_argument('--disable-gpu')
-    co.set_argument('--disable-dev-shm-usage')
-    # RESOLUSI ULTRA-WIDE (5000px) AGAR SEMUA KOLOM TERPAKSA RENDER
-    co.set_argument('--window-size=5000,3000') 
-    co.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+# ==============================================================================
+# FETCH DATA → PUSH FIREBASE
+# ==============================================================================
+def fetch_and_push(api, root_ref):
+    raw = api.fetch()
+    coins = normalize_data(raw)
 
-    try:
-        page = ChromiumPage(addr_or_opts=co)
-        page.set.timeouts(page_load=60)
-        
-        print(f"🌐 Menyerbu Target: {URL_TARGET}")
-        page.get(URL_TARGET)
-        time.sleep(30)
+    if not coins:
+        raise RuntimeError("No data parsed")
 
-        # AKTIFKAN SEMUA KOLOM DULU
-        force_activate_columns(page)
-        
-        # ZOOM OUT EKSTREM AGAR DOM MEMUAT SEMUA DATA
-        page.run_js("document.body.style.zoom = '5%'")
-        
-        ref = db.reference('screener_full_data')
-        status_ref = db.reference('bot_status')
-        start_time = time.time()
+    ts = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
 
-        while (time.time() - start_time) < TIMEOUT_LIMIT:
-            try:
-                # MANUVER GRID SCROLLING (Sangat Penting untuk Lazy Loading)
-                print("🔄 Syncing Grid (Down -> Right -> Top)...")
-                page.run_js("window.scrollTo(0, 15000);")
-                time.sleep(1)
-                page.run_js("window.scrollTo(10000, 15000);") # Geser kanan mentok
-                time.sleep(1)
-                page.run_js("window.scrollTo(0, 0);")
-                time.sleep(2)
+    root_ref.child("coins").update(coins)
+    root_ref.child("metadata").update({
+        "last_update": ts,
+        "total_coins": len(coins),
+        "source": "orion_xhr_api"
+    })
+    root_ref.child("snapshots").child(ts).set(coins)
 
-                # EKSTRAKSI SURGICAL: Mencari element 'div' yang berfungsi sebagai row
-                # Kita mengambil teks sel secara berurutan tanpa filter unik
-                js_extract = """
-                let results = [];
-                let rows = Array.from(document.querySelectorAll('div[role="row"], .table-row, .rt-tr-group'));
-                rows.forEach(row => {
-                    let cells = Array.from(row.querySelectorAll('div, span')).map(c => {
-                        // Hanya ambil div/span yang isinya murni teks (bukan container lagi)
-                        return (c.children.length === 0) ? c.innerText.trim() : "";
-                    }).filter(v => v !== "");
-                    
-                    if(cells.length > 5) results.push(cells);
-                });
-                return results;
-                """
-                grid_data = page.run_js(js_extract)
-                
-                # Jika DOM extraction gagal, gunakan Brute Force Text
-                if not grid_data:
-                    raw_text = page.run_js("return document.body.innerText")
-                    lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
-                else:
-                    # Gabungkan data grid menjadi flat list untuk parser
-                    lines = []
-                    for r in grid_data: lines.extend(r)
+    print(f"✅ {len(coins)} coins updated @ {ts}")
 
-                data_batch = {}
-                count = 0
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# ==============================================================================
+# AUTO CLEAN SNAPSHOT LAMA
+# ==============================================================================
+def cleanup_old_snapshots(root_ref):
+    snap_ref = root_ref.child("snapshots")
+    snaps = snap_ref.get()
 
-                # PARSING ADAPTIVE (Mendeteksi koin dan 36 metrik)
-                idx = 0
-                while idx < len(lines):
-                    line = lines[idx]
-                    
-                    # Logika: Simbol koin adalah kata kapital, bukan menu, panjang 2-10
-                    if (2 <= len(line) <= 12 and line.isupper() and is_clean_symbol(line) and line not in BLACKLIST):
-                        
-                        # Cek baris berikutnya (Harus angka/harga)
-                        if idx + 1 < len(lines):
-                            price_val = lines[idx+1].replace('$', '').replace(',', '').strip()
-                            
-                            is_valid_coin = False
-                            try:
-                                if any(c.isdigit() for c in price_val): is_valid_coin = True
-                            except: pass
-                            
-                            if is_valid_coin:
-                                symbol = line
-                                coin_data = {'updated': ts}
-                                
-                                # SEDOT 36 VARIABEL BERIKUTNYA
-                                ptr = idx + 1
-                                vars_captured = 0
-                                while vars_captured < 36 and ptr < len(lines):
-                                    val = lines[ptr]
-                                    # Jika menabrak koin selanjutnya, stop
-                                    if (vars_captured > 5 and len(val) <= 12 and val.isupper() and 
-                                        is_clean_symbol(val) and val not in BLACKLIST):
-                                        break
-                                    
-                                    coin_data[COLUMNS_KEYS[vars_captured]] = val
-                                    vars_captured += 1
-                                    ptr += 1
-                                
-                                safe_sym = symbol.replace('.', '_').replace('/', '_')
-                                data_batch[safe_sym] = coin_data
-                                count += 1
-                                idx = ptr - 1
-                            else: idx += 1
-                        else: idx += 1
-                    else: idx += 1
+    if not snaps:
+        return
 
-                if data_batch:
-                    ref.update(data_batch)
-                    status_ref.set({
-                        'status': 'ONLINE',
-                        'last_active': ts,
-                        'coins': count,
-                        'vars': 36,
-                        'msg': 'Titan Scraper Success'
-                    })
-                    print(f"✅ [{ts}] TITAN SUCCESS: Terkirim {count} Koin (Full 36 Data).")
-                    sys.stdout.flush()
-                else:
-                    print("⚠️ Data belum terdeteksi. Refreshing browser...")
-                    page.refresh()
-                    time.sleep(15)
+    now = datetime.utcnow()
+    deleted = 0
 
-                gc.collect()
-                time.sleep(15)
+    for key in snaps.keys():
+        try:
+            ts = datetime.strptime(key, "%Y-%m-%d_%H-%M-%S")
+            age_hours = (now - ts).total_seconds() / 3600
 
-            except Exception as e:
-                print(f"⚠️ Loop Error: {e}")
-                time.sleep(5)
+            if age_hours > SNAPSHOT_RETENTION_HOURS:
+                snap_ref.child(key).delete()
+                deleted += 1
+        except:
+            continue
 
-        page.quit()
+    if deleted:
+        print(f"🧹 Cleanup: {deleted} snapshot lama dihapus")
 
-    except Exception as e:
-        print(f"❌ Fatal Error: {e}")
+# ==============================================================================
+# MAIN LOOP
+# ==============================================================================
+def run():
+    print("🚀 ORION XHR BOT — AUTO RELOAD + AUTO CLEAN")
+    init_firebase()
 
+    api = OrionAPI()
+    root_ref = db.reference("screener_orion")
+
+    last_cleanup = 0
+
+    while True:
+        try:
+            fetch_and_push(api, root_ref)
+
+            if time.time() - last_cleanup > CLEANUP_INTERVAL:
+                cleanup_old_snapshots(root_ref)
+                last_cleanup = time.time()
+
+        except Exception as e:
+            print(f"⚠️ Error: {e}")
+            api.rotate_headers()
+
+        print(f"⏳ Sleep {FETCH_INTERVAL}s\n")
+        time.sleep(FETCH_INTERVAL)
+
+# ==============================================================================
 if __name__ == "__main__":
-    run_titan_scraper()
+    run()
     sys.exit(0)
