@@ -2,231 +2,375 @@ import os
 import sys
 import time
 import json
-import random
-import requests
 import logging
 import hashlib
-import threading
 from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional
+from typing import Dict, List, Any, Optional, Union
 
-# ==========================================
-# 1. KONFIGURASI GLOBAL
-# ==========================================
-FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://quant-trading-d5411-default-rtdb.asia-southeast1.firebasedatabase.app/")
-INITIAL_COOKIES = os.environ.get("ORION_COOKIES_JSON", "{}") 
+import requests
 
-ORION_API_URL = "https://orionterminal.com/api/screener"
-CYCLE_ACTIVE_SEC = 270   
-CYCLE_PAUSE_SEC = 30     
-POLL_INTERVAL = 3        
-DATA_LIMIT = 1000        
-MAX_SNAPSHOTS_TO_KEEP = 48 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Hardcoded fallback for Colab/local testing (FILL THIS IN)
+DEFAULT_FIREBASE_URL = "https://your-project.firebaseio.com"
+
+# Environment variables (GitHub Actions will provide these)
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", DEFAULT_FIREBASE_URL)
+ORION_COOKIES_JSON = os.environ.get("ORION_COOKIES_JSON", "{}")
+
+# Timing constraints for GitHub Actions
+RUNTIME_LIMIT_SECONDS = 270  # 4 minutes 30 seconds
+COOLDOWN_SECONDS = 30
+REQUEST_DELAY = 3
+
+# Data validation
+MIN_COINS_THRESHOLD = 50
+
+# Orion Terminal endpoint
+ORION_API_URL = "https://app.orionprotocol.io/api/market/aggregated"
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("Harvester-V5")
+logger = logging.getLogger(__name__)
 
-# ==========================================
-# 2. MESIN INTEGRITAS (CHAINING)
-# ==========================================
-class IntegrityEngine:
-    def __init__(self, firebase_url):
-        self.firebase_url = firebase_url.rstrip('/')
-        self.prev_hash = self._load_last_hash()
 
-    def _load_last_hash(self) -> str:
-        try:
-            url = f"{self.firebase_url}/orion_snapshots.json?orderBy=\"$key\"&limitToLast=1"
-            res = requests.get(url, timeout=10)
-            if res.status_code == 200 and res.json():
-                last_key = list(res.json().keys())[0]
-                last_data = res.json()[last_key]
-                if '_integrity' in last_data:
-                    return last_data['_integrity'].get('chain_hash', "0" * 64)
-        except: pass
-        return "0" * 64
+# ============================================================================
+# UNIVERSAL DATA PROCESSOR (THE ANTI-FRAGILE ENGINE)
+# ============================================================================
 
-    def compute_hashes(self, data: Dict) -> Tuple[str, str]:
-        data_str = json.dumps(data, sort_keys=True)
-        data_hash = hashlib.sha256(data_str.encode()).hexdigest()
-        chain_hash = hashlib.sha256(f"{self.prev_hash}{data_hash}".encode()).hexdigest()
-        self.prev_hash = chain_hash
-        return data_hash, chain_hash
-
-# ==========================================
-# 3. PEMROSES DATA (AUTO-DETECT FIX)
-# ==========================================
 class DataProcessor:
+    """
+    Universal parser that handles ANY structure Orion might send:
+    - List of objects
+    - Dict of objects
+    - Nested {"data": [...]} structures
+    - Obfuscated numeric keys
+    """
+    
+    # Fallback key mappings (ordered by priority)
+    PRICE_KEYS = ['11', 'last_price', 'close', 'price', 'p', 'lastPrice']
+    VOLUME_KEYS = ['10', 'volume_24h', 'volume', 'v', 'volume24h', 'vol']
+    CHANGE_KEYS = ['6', 'change_24h', 'change', 'ch', 'change24h', 'priceChange']
+    RSI_KEYS = ['50', 'rsi_14', 'rsi', '14', 'rsi14']
+    SYMBOL_KEYS = ['symbol', 'pair', 's', 'ticker', 'coin']
+    
     @staticmethod
-    def clean_ticker(raw_key: str) -> str:
-        return raw_key.split('-')[0].split('/')[0].upper().replace('USDT', '')
-
-    @staticmethod
-    def parse(raw_data: Dict) -> Dict:
-        processed = {}
-        fetch_time = datetime.now().isoformat()
-
-        # --- FIX: LOGIKA EKSTRAKSI ITEM YANG LEBIH TANGGUH ---
-        items = []
+    def normalize_structure(raw_data: Any) -> List[Dict]:
+        """
+        Convert ANY input structure into a List of Dict.
+        
+        Handles:
+        - List directly
+        - Dict with 'data' key containing list
+        - Dict where values are the items
+        """
+        logger.info(f"🔍 Raw data type: {type(raw_data).__name__}")
+        
         if isinstance(raw_data, list):
-            items = [(x.get('ticker', 'UNK'), x) for x in raw_data]
+            logger.info(f"📦 Structure: Direct list with {len(raw_data)} items")
+            return raw_data
+        
         elif isinstance(raw_data, dict):
-            # Jika dibungkus dalam key 'data' (Sering terjadi pada API Orion)
+            # Check for nested 'data' key
             if 'data' in raw_data and isinstance(raw_data['data'], list):
-                items = [(x.get('ticker', 'UNK'), x) for x in raw_data['data']]
-            else:
-                items = raw_data.items()
-
-        for k, v in items:
-            try:
-                # Lewati jika v bukan dictionary (mencegah error list in list)
-                if not isinstance(v, dict): continue
-
-                symbol = DataProcessor.clean_ticker(str(k))
-                if symbol in ['USDT', 'USDC', 'DAI', 'BGB', 'FDUSD', 'TUSD', 'EUR']: continue
-                
-                # Pemetaan Key dengan Fallback Multiple Names (Mengatasi Obfuscation)
-                price = float(v.get('11') or v.get('last_price') or v.get('price') or v.get('close') or 0)
-                vol = float(v.get('10') or v.get('volume_24h') or v.get('volume') or v.get('v') or 0)
-                change = float(v.get('6') or v.get('change_24h') or v.get('change') or 0)
-                rsi = float(v.get('rsi_14') or v.get('rsi') or 50)
-                
-                # Validasi: Harga harus ada agar koin masuk hitungan
-                if price > 0:
-                    processed[symbol] = {
-                        'price': price,
-                        'vol_24h': vol,
-                        'change_24h': change,
-                        'rsi': rsi,
-                        'funding': float(v.get('funding_rate') or v.get('funding') or 0),
-                        'oi': float(v.get('oi') or v.get('open_interest') or 0),
-                        'ts': fetch_time
-                    }
-            except Exception: continue
+                logger.info(f"📦 Structure: Nested dict with 'data' key, {len(raw_data['data'])} items")
+                return raw_data['data']
             
-        return processed
-
-# ==========================================
-# 4. KONEKSI & WRITER
-# ==========================================
-class OrionScraper:
-    def __init__(self, firebase_url):
-        self.session = requests.Session()
-        self.fb_url = firebase_url.rstrip('/')
-        self._setup_headers()
-        self._load_initial_cookies()
-
-    def _setup_headers(self):
-        self.session.headers.update({
-            'accept': 'application/json, text/javascript, */*; q=0.01',
-            'referer': 'https://orionterminal.com/screener',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'x-requested-with': 'XMLHttpRequest'
-        })
-
-    def _load_initial_cookies(self):
-        try:
-            cookies = json.loads(INITIAL_COOKIES)
-            self.session.cookies.update(cookies)
-        except: pass
-
-    def fetch_all(self) -> Optional[Dict]:
-        params = {"limit": DATA_LIMIT, "sort": "volume", "order": "desc"}
-        try:
-            res = self.session.get(ORION_API_URL, params=params, timeout=15)
-            if res.status_code == 200:
-                return res.json()
-            elif res.status_code == 403:
-                logger.error("❌ Error 403: Akses Orion ditolak (Cookies kadaluarsa).")
+            # Check for other common wrapper keys
+            for wrapper_key in ['results', 'items', 'coins', 'markets']:
+                if wrapper_key in raw_data and isinstance(raw_data[wrapper_key], list):
+                    logger.info(f"📦 Structure: Nested dict with '{wrapper_key}' key, {len(raw_data[wrapper_key])} items")
+                    return raw_data[wrapper_key]
+            
+            # Treat dict values as items
+            items = list(raw_data.values())
+            logger.info(f"📦 Structure: Dict values extracted, {len(items)} items")
+            return items
+        
+        else:
+            logger.warning(f"⚠️ Unexpected data type: {type(raw_data)}")
+            return []
+    
+    @staticmethod
+    def extract_value(item: Dict, key_candidates: List[str], default: float = 0.0) -> float:
+        """
+        Try multiple keys in priority order, return first valid value.
+        Converts to float with error handling.
+        """
+        for key in key_candidates:
+            if key in item:
+                try:
+                    value = item[key]
+                    if value is None or value == '':
+                        continue
+                    return float(value)
+                except (ValueError, TypeError):
+                    continue
+        return default
+    
+    @classmethod
+    def parse_item(cls, item: Dict) -> Optional[Dict[str, Union[str, float]]]:
+        """
+        Extract normalized data from a single item.
+        Returns None if critical fields are missing.
+        """
+        if not isinstance(item, dict):
             return None
-        except: return None
+        
+        # Extract symbol (critical field)
+        symbol = None
+        for key in cls.SYMBOL_KEYS:
+            if key in item and item[key]:
+                symbol = str(item[key])
+                break
+        
+        if not symbol:
+            return None
+        
+        # Extract numerical fields with fallbacks
+        price = cls.extract_value(item, cls.PRICE_KEYS)
+        volume = cls.extract_value(item, cls.VOLUME_KEYS)
+        change = cls.extract_value(item, cls.CHANGE_KEYS)
+        rsi = cls.extract_value(item, cls.RSI_KEYS)
+        
+        return {
+            'symbol': symbol,
+            'price': price,
+            'volume_24h': volume,
+            'change_24h': change,
+            'rsi': rsi,
+            'raw_keys': list(item.keys())[:10]  # Store sample for debugging
+        }
+    
+    @classmethod
+    def process(cls, raw_data: Any) -> List[Dict]:
+        """
+        Main entry point: Convert any structure to normalized coin list.
+        """
+        # Step 1: Normalize to list
+        items = cls.normalize_structure(raw_data)
+        
+        # Step 2: Parse each item
+        parsed_coins = []
+        failed_count = 0
+        
+        for i, item in enumerate(items):
+            parsed = cls.parse_item(item)
+            if parsed:
+                parsed_coins.append(parsed)
+            else:
+                failed_count += 1
+                if failed_count <= 3:  # Log first 3 failures
+                    logger.warning(f"⚠️ Parsing failed for item {i}: {str(item)[:100]}")
+        
+        logger.info(f"✅ Parsed {len(parsed_coins)} coins successfully")
+        if failed_count > 0:
+            logger.info(f"⚠️ Failed to parse {failed_count} items")
+        
+        return parsed_coins
 
-class FirebaseWriter:
-    def __init__(self, db_url):
-        self.db_url = db_url.rstrip('/')
 
-    def push_snapshot(self, market_data: Dict, integrity: Tuple[str, str]):
-        if not market_data: return
-        ts_key = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        data_hash, chain_hash = integrity
+# ============================================================================
+# FIREBASE CLIENT
+# ============================================================================
+
+class FirebaseClient:
+    """Handles all Firebase operations with integrity validation."""
+    
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip('/')
+    
+    @staticmethod
+    def calculate_hash(data: Dict) -> str:
+        """Calculate SHA256 hash for data integrity."""
+        json_str = json.dumps(data, sort_keys=True)
+        return hashlib.sha256(json_str.encode()).hexdigest()
+    
+    def push_snapshot(self, coins: List[Dict]) -> bool:
+        """
+        Push data snapshot to Firebase with atomic update.
+        Returns True on success.
+        """
+        timestamp = datetime.utcnow().isoformat() + 'Z'
+        
         payload = {
-            "market": market_data,
-            "_integrity": {
-                "hash": data_hash,
-                "chain_hash": chain_hash,
-                "count": len(market_data),
-                "server_ts": time.time()
+            'timestamp': timestamp,
+            'coin_count': len(coins),
+            'coins': coins,
+            '_metadata': {
+                'harvester_version': '6.0',
+                'integrity_hash': self.calculate_hash(coins)
             }
         }
+        
+        # Atomic PUT to overwrite snapshot
+        endpoint = f"{self.base_url}/orion_snapshots/{timestamp.replace(':', '-')}.json"
+        
         try:
-            res = requests.put(f"{self.db_url}/orion_snapshots/{ts_key}.json", json=payload, timeout=10)
-            if res.status_code == 200:
-                logger.info(f"✅ Data Terkirim: {ts_key} | Koin: {len(market_data)} | Hash: {chain_hash[:8]}")
-                self.cleanup()
-        except Exception as e:
-            logger.error(f"❌ Gagal kirim ke Firebase: {e}")
+            response = requests.put(endpoint, json=payload, timeout=10)
+            response.raise_for_status()
+            logger.info(f"🚀 Pushed {len(coins)} coins to Firebase")
+            logger.info(f"📍 Endpoint: {endpoint}")
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Firebase push failed: {e}")
+            return False
 
-    def cleanup(self):
+
+# ============================================================================
+# MAIN HARVESTER
+# ============================================================================
+
+class OrionHarvester:
+    """Main orchestrator for data collection."""
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.firebase = FirebaseClient(FIREBASE_DB_URL)
+        self.start_time = time.time()
+        self._setup_session()
+    
+    def _setup_session(self):
+        """Configure session with cookies and headers."""
+        # Parse cookies from environment
         try:
-            res = requests.get(f"{self.db_url}/orion_snapshots.json?shallow=true", timeout=5)
-            if res.status_code != 200: return
-            keys = sorted(list(res.json().keys()))
-            if len(keys) > MAX_SNAPSHOTS_TO_KEEP:
-                to_delete = keys[:-MAX_SNAPSHOTS_TO_KEEP]
-                for k in to_delete[:3]:
-                    requests.delete(f"{self.db_url}/orion_snapshots/{k}.json")
-        except: pass
-
-# ==========================================
-# 🚀 MAIN LOOP
-# ==========================================
-def start_harvester():
-    if not FIREBASE_DB_URL:
-        logger.critical("🔥 Error: FIREBASE_DB_URL belum diatur!")
-        return
-
-    scraper = OrionScraper(FIREBASE_DB_URL)
-    writer = FirebaseWriter(FIREBASE_DB_URL)
-    integrity = IntegrityEngine(FIREBASE_DB_URL)
+            cookies = json.loads(ORION_COOKIES_JSON)
+            for name, value in cookies.items():
+                self.session.cookies.set(name, value)
+            logger.info(f"🍪 Loaded {len(cookies)} cookies")
+        except json.JSONDecodeError:
+            logger.warning("⚠️ No valid cookies found, proceeding without authentication")
+        
+        # Set realistic headers
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://app.orionprotocol.io/',
+            'Origin': 'https://app.orionprotocol.io'
+        })
     
-    logger.info("🚀 ORION DATA HARVESTER v5.3 DIMULAI")
-    
-    while True:
-        cycle_start = time.time()
-        logger.info("🟢 Memulai Siklus Pengambilan Data...")
-
-        while (time.time() - cycle_start) < CYCLE_ACTIVE_SEC:
-            loop_start = time.time()
-            raw = scraper.fetch_all()
+    def fetch_data(self) -> Optional[Any]:
+        """Fetch raw data from Orion API."""
+        try:
+            logger.info("📡 Fetching data from Orion...")
+            response = self.session.get(ORION_API_URL, timeout=15)
             
-            if raw:
-                # Debugging: lihat kunci utama jika hasil 0
-                clean_data = DataProcessor.parse(raw)
-                
-                if len(clean_data) > 0:
-                    hashes = integrity.compute_hashes(clean_data)
-                    writer.push_snapshot(clean_data, hashes)
-                else:
-                    # Log detail jika masih 0 untuk investigasi
-                    sample_keys = list(raw.keys())[:5] if isinstance(raw, dict) else "List"
-                    logger.warning(f"⚠️ Hasil parsing nol. Struktur raw keys: {sample_keys}")
-            else:
-                logger.error("❌ Gagal mendapatkan data (Cek koneksi/cookies).")
+            # Check for auth failures
+            if response.status_code == 401:
+                logger.error("❌ Authentication failed - cookies expired")
+                return None
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            logger.info(f"✅ Received response: {len(str(data))} bytes")
+            return data
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Request failed: {e}")
+            return None
+    
+    def should_continue(self) -> bool:
+        """Check if we should continue the loop."""
+        elapsed = time.time() - self.start_time
+        remaining = RUNTIME_LIMIT_SECONDS - elapsed
+        
+        if remaining <= 0:
+            logger.info(f"⏰ Runtime limit reached ({RUNTIME_LIMIT_SECONDS}s)")
+            return False
+        
+        logger.info(f"⏱️ Remaining time: {int(remaining)}s")
+        return True
+    
+    def harvest_cycle(self) -> bool:
+        """
+        Single harvest cycle.
+        Returns True if data was successfully pushed.
+        """
+        # Fetch raw data
+        raw_data = self.fetch_data()
+        if raw_data is None:
+            return False
+        
+        # Parse with universal processor
+        coins = DataProcessor.process(raw_data)
+        
+        # Validate
+        if len(coins) < MIN_COINS_THRESHOLD:
+            logger.warning(f"⚠️ Only {len(coins)} coins parsed (threshold: {MIN_COINS_THRESHOLD})")
+            logger.warning("⚠️ Skipping Firebase push - data may be incomplete")
+            return False
+        
+        # Push to Firebase
+        success = self.firebase.push_snapshot(coins)
+        return success
+    
+    def run(self):
+        """Main execution loop with GitHub Actions lifecycle."""
+        logger.info("=" * 70)
+        logger.info("🚀 Orion Harvester v6.0 STARTING")
+        logger.info(f"⏰ Runtime limit: {RUNTIME_LIMIT_SECONDS}s")
+        logger.info(f"🔥 Firebase URL: {FIREBASE_DB_URL}")
+        logger.info("=" * 70)
+        
+        cycle_count = 0
+        success_count = 0
+        
+        # Main watchdog loop
+        while self.should_continue():
+            cycle_count += 1
+            logger.info(f"\n{'='*70}")
+            logger.info(f"🔄 Cycle {cycle_count} starting...")
+            logger.info(f"{'='*70}")
+            
+            success = self.harvest_cycle()
+            if success:
+                success_count += 1
+            
+            # Rate limiting
+            if self.should_continue():
+                logger.info(f"💤 Sleeping {REQUEST_DELAY}s (rate limit)...")
+                time.sleep(REQUEST_DELAY)
+        
+        # Graceful shutdown
+        logger.info("\n" + "=" * 70)
+        logger.info("🏁 GRACEFUL SHUTDOWN INITIATED")
+        logger.info(f"📊 Total cycles: {cycle_count}")
+        logger.info(f"✅ Successful pushes: {success_count}")
+        logger.info(f"💤 Cooldown period: {COOLDOWN_SECONDS}s")
+        logger.info("=" * 70)
+        
+        time.sleep(COOLDOWN_SECONDS)
+        logger.info("👋 Harvester exiting cleanly")
+        sys.exit(0)
 
-            elapsed = time.time() - loop_start
-            time.sleep(max(0, POLL_INTERVAL - elapsed))
 
-        logger.info(f"⏸️ Siklus Selesai. Istirahat {CYCLE_PAUSE_SEC}s...")
-        time.sleep(CYCLE_PAUSE_SEC)
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+def main():
+    """Entry point with error handling."""
+    try:
+        harvester = OrionHarvester()
+        harvester.run()
+    except KeyboardInterrupt:
+        logger.info("\n⚠️ Interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        logger.exception(f"💥 Fatal error: {e}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    try:
-        start_harvester()
-    except KeyboardInterrupt:
-        logger.info("🛑 Bot dihentikan manual.")
-    except Exception as e:
-        logger.critical(f"💀 CRASH FATAL: {e}")
+    main()
